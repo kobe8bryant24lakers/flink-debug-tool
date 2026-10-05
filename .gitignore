@@ -1,0 +1,26 @@
+target/
+.maven-repo/
+.DS_Store
+*.log
+.idea/
+*.iml
+
+# Local credentials and environment settings
+.env
+.env.*
+!.env.example
+.aws/
+*.pem
+*.key
+
+# Downloaded snapshots, user JARs, and analysis output
+snapshots/
+checkpoints/
+savepoints/
+reports/
+_metadata
+*.sst
+*.ldb
+*.jar
+*.class
+*.dump
