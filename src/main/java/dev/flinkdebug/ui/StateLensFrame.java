@@ -9,6 +9,7 @@ import dev.flinkdebug.core.LocalStreamQueryService.QueryReport;
 import dev.flinkdebug.core.SnapshotInspector;
 import dev.flinkdebug.core.SnapshotReport;
 import dev.flinkdebug.core.SnapshotSession;
+import org.apache.flink.runtime.util.EnvironmentInformation;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
@@ -123,12 +124,48 @@ public final class StateLensFrame extends JFrame {
 
     /** Starts the same asynchronous import as the UI button; call on the Swing event thread. */
     public void openSnapshot(Path path) {
+        requireImportReady();
+        snapshotPath.setText(Objects.requireNonNull(path, "快照路径不能为空。").toAbsolutePath().normalize().toString());
+        loadSnapshot();
+    }
+
+    /** Initializes relocation/JAR settings before starting the regular asynchronous import. */
+    public void openSnapshot(Path path, List<PathMapping> relocation, List<Path> jars) {
+        requireImportReady();
+        Path normalizedSnapshot = Objects.requireNonNull(path, "快照路径不能为空。").toAbsolutePath().normalize();
+        List<PathMapping> mappingCopy = List.copyOf(Objects.requireNonNull(relocation, "路径映射列表不能为空。"));
+        List<Path> jarCopy = List.copyOf(Objects.requireNonNull(jars, "用户 JAR 列表不能为空。"));
+        List<PathMapping> normalizedMappings = new ArrayList<>(mappingCopy.size());
+        for (PathMapping mapping : mappingCopy) {
+            String prefix = Objects.requireNonNull(mapping.originalPrefix(), "映射的原始 URI 前缀不能为空。").trim();
+            if (prefix.isBlank()) throw new IllegalArgumentException("映射的原始 URI 前缀不能为空。");
+            Path directory = Objects.requireNonNull(mapping.localDirectory(), "映射的本地目录不能为空。").toAbsolutePath().normalize();
+            normalizedMappings.add(new PathMapping(prefix, directory));
+        }
+        List<Path> normalizedJars = new ArrayList<>(jarCopy.size());
+        for (Path jar : jarCopy) {
+            Path normalizedJar = jar.toAbsolutePath().normalize();
+            if (!normalizedJars.contains(normalizedJar)) normalizedJars.add(normalizedJar);
+        }
+
+        // Validate/copy all arguments above before replacing any visible import configuration.
+        if (mappings.isEditing()) mappings.getCellEditor().cancelCellEditing();
+        mappingModel.setRowCount(0);
+        for (PathMapping mapping : normalizedMappings) {
+            mappingModel.addRow(new Object[]{mapping.originalPrefix(), mapping.localDirectory().toString()});
+        }
+        userJars.clear();
+        userJars.addAll(normalizedJars);
+        snapshotPath.setText(normalizedSnapshot.toString());
+        refreshJars();
+        loadSnapshot();
+    }
+
+    private void requireImportReady() {
         if (!SwingUtilities.isEventDispatchThread()) {
             throw new IllegalStateException("快照导入必须在 Swing 事件线程上启动。");
         }
         if (busy || closing) throw new IllegalStateException("当前任务尚未结束，无法启动新的快照导入。");
-        snapshotPath.setText(Objects.requireNonNull(path, "快照路径不能为空。").toAbsolutePath().normalize().toString());
-        loadSnapshot();
     }
 
     private static void installTheme() {
@@ -169,7 +206,7 @@ public final class StateLensFrame extends JFrame {
         JLabel title = new JLabel(APP);
         title.setFont(title.getFont().deriveFont(Font.BOLD, 25f));
         title.setForeground(INK);
-        JLabel subtitle = new JLabel("离线快照分析  /  Flink 1.20  /  RocksDB");
+        JLabel subtitle = new JLabel("离线快照分析  /  Flink " + EnvironmentInformation.getVersion() + "  /  RocksDB");
         subtitle.setForeground(MUTED);
         panel.add(title, BorderLayout.WEST);
         panel.add(subtitle, BorderLayout.EAST);
