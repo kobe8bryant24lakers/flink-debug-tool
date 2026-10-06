@@ -18,15 +18,17 @@ public final class Main {
     public static void main(String[] args) {
         try {
             if (args.length == 0) {
-                if (GraphicsEnvironment.isHeadless()) throw new IllegalArgumentException("当前环境无桌面，可使用 --inspect、--preview 或 --query。");
-                SwingUtilities.invokeLater(() -> {
-                    try {
-                        for (var theme : UIManager.getInstalledLookAndFeels()) {
-                            if (theme.getName().equals("Nimbus")) UIManager.setLookAndFeel(theme.getClassName());
-                        }
-                    } catch (Exception ignored) { /* System theme is sufficient. */ }
-                    new StateLensFrame().setVisible(true);
-                });
+                launchDesktop(null);
+                return;
+            }
+            if (args[0].equals("--open")) {
+                if (args.length != 2 || args[1].isBlank() || args[1].startsWith("--"))
+                    throw new IllegalArgumentException("--open 格式: --open /path/to/snapshot");
+                launchDesktop(Path.of(args[1]));
+                return;
+            }
+            if (args.length == 1 && !args[0].startsWith("--")) {
+                launchDesktop(Path.of(args[0]));
                 return;
             }
             if (List.of(args).contains("--help")) { usage(); return; }
@@ -40,6 +42,20 @@ public final class Main {
             System.err.println("解析失败: " + e.getMessage());
             System.exit(2);
         }
+    }
+
+    private static void launchDesktop(Path snapshot) {
+        if (GraphicsEnvironment.isHeadless()) throw new IllegalArgumentException("当前环境无桌面，可使用 --inspect、--preview 或 --query。");
+        SwingUtilities.invokeLater(() -> {
+            try {
+                for (var theme : UIManager.getInstalledLookAndFeels()) {
+                    if (theme.getName().equals("Nimbus")) UIManager.setLookAndFeel(theme.getClassName());
+                }
+            } catch (Exception ignored) { /* System theme is sufficient. */ }
+            var frame = new StateLensFrame();
+            frame.setVisible(true);
+            if (snapshot != null) frame.openSnapshot(snapshot);
+        });
     }
 
     private static void runCli(String[] args) throws Exception {
@@ -89,6 +105,7 @@ public final class Main {
         System.out.println("""
                 Flink State Lens · Flink 1.20 离线状态分析
                 无参数: 打开桌面界面
+                --open /path/to/snapshot: 打开桌面界面并自动导入快照（也可直接传入快照路径）
                 --inspect /path/to/snapshot: 元数据与状态文件完整性 JSON
                 --preview /path/to/snapshot --operator HASH [--subtask 0] [--limit 200]: 原始状态与可解码样本 JSON
                 --query /path/to/snapshot --operator HASH --state NAME [--kind VALUE|LIST|MAP]
