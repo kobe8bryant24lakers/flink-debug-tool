@@ -121,6 +121,16 @@ public final class StateLensFrame extends JFrame {
         });
     }
 
+    /** Starts the same asynchronous import as the UI button; call on the Swing event thread. */
+    public void openSnapshot(Path path) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            throw new IllegalStateException("快照导入必须在 Swing 事件线程上启动。");
+        }
+        if (busy || closing) throw new IllegalStateException("当前任务尚未结束，无法启动新的快照导入。");
+        snapshotPath.setText(Objects.requireNonNull(path, "快照路径不能为空。").toAbsolutePath().normalize().toString());
+        loadSnapshot();
+    }
+
     private static void installTheme() {
         try {
             for (UIManager.LookAndFeelInfo info : UIManager.getInstalledLookAndFeels()) {
@@ -447,11 +457,16 @@ public final class StateLensFrame extends JFrame {
             if (snapshotPath.getText().isBlank()) throw new IllegalArgumentException("请选择本地快照目录或 _metadata 文件。");
             source = Path.of(snapshotPath.getText().trim()).toAbsolutePath().normalize();
             relocation = pathMappings();
-        } catch (Exception error) { showFailure("无法导入", error); return; }
+        } catch (Exception error) {
+            logImportFailure(error);
+            showFailure("无法导入", error);
+            return;
+        }
         List<Path> jars = List.copyOf(userJars);
         SnapshotSession previous = session;
         long request = ++generation;
         beginOperation("正在读取快照元数据…");
+        System.out.println("[Flink State Lens] snapshot import started");
         new SwingWorker<SnapshotSession, Void>() {
             @Override protected SnapshotSession doInBackground() throws Exception {
                 SnapshotSession opened = new SnapshotInspector().open(source, relocation, jars);
@@ -472,10 +487,23 @@ public final class StateLensFrame extends JFrame {
                     preview = null;
                     renderReport();
                     setStatus(report.diagnostics().isEmpty() ? "快照已加载 · 请选择子任务读取有界样本" : "快照已加载 · " + report.diagnostics().size() + " 条诊断，详见“诊断”页", hasError(report) ? "ERROR" : report.diagnostics().isEmpty() ? "INFO" : "WARN");
-                } catch (Exception error) { showFailure("导入失败", unwrap(error)); }
+                    System.out.println("[Flink State Lens] snapshot import completed: checkpointId="
+                            + report.checkpointId() + ", operators=" + report.operators().size()
+                            + ", files=" + report.files().size() + ", diagnostics=" + report.diagnostics().size());
+                } catch (Exception error) {
+                    Throwable cause = unwrap(error);
+                    logImportFailure(cause);
+                    showFailure("导入失败", cause);
+                }
                 finally { endOperation(); }
             }
         }.execute();
+    }
+
+    private static void logImportFailure(Throwable error) {
+        String reason = Objects.toString(error.getMessage(), error.getClass().getSimpleName()).replace('\n', ' ').replace('\r', ' ');
+        if (reason.length() > 300) reason = reason.substring(0, 300) + "…";
+        System.err.println("[Flink State Lens] snapshot import failed: " + error.getClass().getSimpleName() + " - " + reason);
     }
 
     private void renderReport() {
