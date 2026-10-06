@@ -56,6 +56,7 @@ public final class StateLensFrame extends JFrame {
     private final List<Path> userJars = new ArrayList<>();
 
     private final JLabel snapshotMetric = metricValue();
+    private final JLabel snapshotTypeSummary = new JLabel("类型：尚未加载");
     private final JLabel operatorMetric = metricValue();
     private final JLabel referencedMetric = metricValue();
     private final JLabel checkpointedMetric = metricValue();
@@ -64,7 +65,7 @@ public final class StateLensFrame extends JFrame {
     private final JLabel selectionSummary = new JLabel("选择算子或子任务");
     private final DefaultTableModel filesModel = readOnlyModel("算子 ID", "子任务", "类别", "句柄类型", "Key-group", "本地状态", "声明大小", "实际大小", "原始路径", "本地路径");
     private final DefaultTableModel schemasModel = readOnlyModel("状态名", "状态类型", "Key 序列化器", "Namespace 序列化器", "Value 序列化器");
-    private final DefaultTableModel samplesModel = readOnlyModel("状态名", "Key-group", "Key（解码）", "Namespace（解码）", "Value（解码）", "Key 原始 HEX", "Value 原始 HEX", "解码结果");
+    private final DefaultTableModel samplesModel = readOnlyModel("状态名", "Key（解码）", "Map key（解码）", "Value（解码）", "Namespace（解码）", "TTL 时间戳（ms）", "Key-group", "解码结果", "Key 原始 HEX", "Value 原始 HEX");
     private final DefaultTableModel diagnosticsModel = readOnlyModel("级别", "诊断说明");
     private final JTable filesTable = table(filesModel);
     private final JTable schemasTable = table(schemasModel);
@@ -265,7 +266,10 @@ public final class StateLensFrame extends JFrame {
         panel.setOpaque(false);
         JPanel cards = new JPanel(new GridLayout(1, 4, 12, 0));
         cards.setOpaque(false);
-        cards.add(metricCard("快照 / Checkpoint ID", snapshotMetric));
+        JPanel snapshotCard = metricCard("Checkpoint ID", snapshotMetric);
+        snapshotTypeSummary.setForeground(MUTED);
+        snapshotCard.add(snapshotTypeSummary, BorderLayout.SOUTH);
+        cards.add(snapshotCard);
         cards.add(metricCard("算子数", operatorMetric));
         cards.add(metricCard("引用状态大小", referencedMetric));
         cards.add(metricCard("本次持久化大小", checkpointedMetric));
@@ -320,9 +324,8 @@ public final class StateLensFrame extends JFrame {
         panel.add(search, BorderLayout.NORTH);
         samplesTable.setRowSorter(sampleSorter);
         samplesTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
-        for (int i = 0; i < samplesTable.getColumnCount(); i++) {
-            samplesTable.getColumnModel().getColumn(i).setPreferredWidth(i == 1 ? 95 : i == 0 ? 170 : 265);
-        }
+        int[] sampleWidths = {175, 165, 170, 310, 105, 145, 75, 250, 265, 265};
+        for (int i = 0; i < sampleWidths.length; i++) samplesTable.getColumnModel().getColumn(i).setPreferredWidth(sampleWidths[i]);
         panel.add(new JScrollPane(samplesTable), BorderLayout.CENTER);
         sampleSummary.setForeground(MUTED);
         panel.add(sampleSummary, BorderLayout.SOUTH);
@@ -544,7 +547,9 @@ public final class StateLensFrame extends JFrame {
     }
 
     private void renderReport() {
-        snapshotMetric.setText(report.snapshotKind() + " / " + report.checkpointId());
+        snapshotMetric.setText(Long.toString(report.checkpointId()));
+        snapshotTypeSummary.setText("类型：" + shortSnapshotKind(report.snapshotKind()));
+        snapshotTypeSummary.setToolTipText(report.snapshotKind());
         operatorMetric.setText(Integer.toString(report.operators().size()));
         referencedMetric.setText(bytes(report.referencedStateBytes()));
         checkpointedMetric.setText(bytes(report.checkpointedBytes()));
@@ -603,6 +608,7 @@ public final class StateLensFrame extends JFrame {
         schemasModel.setRowCount(0);
         samplesModel.setRowCount(0);
         sampleSummary.setText("未读取状态数据。请选择具体子任务，然后点击“读取样本”。");
+        sampleSummary.setToolTipText(null);
         details.setTitleAt(1, "状态 Schema");
         details.setTitleAt(2, "数据样本");
         if (report != null) {
@@ -646,13 +652,19 @@ public final class StateLensFrame extends JFrame {
         schemasModel.setRowCount(0);
         samplesModel.setRowCount(0);
         for (PreviewReport.StateSchema schema : preview.schemas()) schemasModel.addRow(new Object[]{schema.name(), schema.type(), schema.keySerializer(), schema.namespaceSerializer(), schema.valueSerializer()});
-        for (PreviewReport.StateEntry entry : preview.entries()) samplesModel.addRow(new Object[]{entry.stateName(), entry.keyGroup(), entry.key(), entry.namespace(), entry.value(), entry.keyHex(), entry.valueHex(), entry.decodeStatus()});
+        for (PreviewReport.StateEntry entry : preview.entries()) samplesModel.addRow(new Object[]{entry.stateName(), entry.key(), entry.mapKey(), entry.value(), entry.namespace(), entry.ttlTimestamp(), entry.keyGroup(), entry.decodeStatus(), entry.keyHex(), entry.valueHex()});
         diagnosticsModel.setRowCount(0);
         report.diagnostics().forEach(d -> diagnosticsModel.addRow(new Object[]{d.severity(), d.message()}));
         preview.warnings().forEach(w -> diagnosticsModel.addRow(new Object[]{"WARN", w}));
         details.setTitleAt(1, "状态 Schema（" + preview.schemas().size() + "）");
         details.setTitleAt(2, "数据样本（" + preview.entries().size() + "）");
-        sampleSummary.setText("已读取 " + preview.entries().size() + " 条" + (preview.truncated() ? " · 已达到样本上限，结果被截断" : "") + "；样本不代表状态总记录数。HEX 为原始字节。" );
+        long decoded = preview.entries().stream().filter(entry -> hasDecodeStatus(entry, "DECODED")).count();
+        long partial = preview.entries().stream().filter(entry -> hasDecodeStatus(entry, "PARTIAL")).count();
+        long raw = preview.entries().size() - decoded - partial;
+        sampleSummary.setText("样本 " + preview.entries().size() + " 条 · 完整解码 " + decoded + " · 部分解码 " + partial
+                + " · 原始/失败 " + raw + (preview.truncated() ? " · 已截断" : "")
+                + "；样本不代表状态总记录数。TTL 为存储的访问时间戳，不判断过期。HEX 可横向滚动/双击查看。");
+        sampleSummary.setToolTipText(sampleSummary.getText());
         filterSamples();
     }
 
@@ -738,8 +750,8 @@ public final class StateLensFrame extends JFrame {
         List<PreviewReport.StateEntry> entries = List.copyOf(preview.entries());
         runExport(target, () -> {
             try (BufferedWriter writer = Files.newBufferedWriter(target, StandardCharsets.UTF_8)) {
-                writeCsv(writer, "stateName", "keyGroup", "key", "namespace", "value", "keyHex", "valueHex", "decodeStatus");
-                for (PreviewReport.StateEntry entry : entries) writeCsv(writer, entry.stateName(), Integer.toString(entry.keyGroup()), entry.key(), entry.namespace(), entry.value(), entry.keyHex(), entry.valueHex(), entry.decodeStatus());
+                writeCsv(writer, "stateName", "key", "mapKey", "value", "namespace", "ttlTimestamp", "keyGroup", "decodeStatus", "keyHex", "valueHex");
+                for (PreviewReport.StateEntry entry : entries) writeCsv(writer, entry.stateName(), entry.key(), entry.mapKey(), entry.value(), entry.namespace(), entry.ttlTimestamp() == null ? "" : entry.ttlTimestamp().toString(), Integer.toString(entry.keyGroup()), entry.decodeStatus(), entry.keyHex(), entry.valueHex());
             }
         });
     }
@@ -933,6 +945,21 @@ public final class StateLensFrame extends JFrame {
 
     private static boolean hasError(SnapshotReport report) {
         return report.diagnostics().stream().anyMatch(d -> "ERROR".equalsIgnoreCase(d.severity()));
+    }
+
+    private static boolean hasDecodeStatus(PreviewReport.StateEntry entry, String status) {
+        String value = Objects.toString(entry.decodeStatus(), "").toUpperCase(java.util.Locale.ROOT);
+        return value.equals(status) || value.startsWith(status + ":");
+    }
+
+    static String shortSnapshotKind(String kind) {
+        if (kind == null || kind.isBlank() || "UNKNOWN".equalsIgnoreCase(kind.trim())) return "未记录";
+        String value = kind.trim();
+        java.util.regex.Matcher name = Pattern.compile("(?i)name\\s*=\\s*['\"]([^'\"]+)['\"]").matcher(value);
+        if (name.find()) value = name.group(1);
+        else if (value.toUpperCase(java.util.Locale.ROOT).contains("SAVEPOINT")) value = "Savepoint";
+        else if (value.toUpperCase(java.util.Locale.ROOT).contains("CHECKPOINT")) value = "Checkpoint";
+        return value.length() > 32 ? value.substring(0, 32) + "…" : value;
     }
 
     private static String availability(String value) {

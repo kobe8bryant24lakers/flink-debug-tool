@@ -40,8 +40,8 @@ mvn -B -ntp -Dmaven.repo.local=.maven-repo package
 1. 手动下载快照及其引用的全部状态文件。增量 RocksDB checkpoint 往往需要 job 目录下的 `shared` 文件，单独下载 `chk-N/_metadata` 不够。
 2. 打开快照目录或 `_metadata` 文件。先查看文件完整性，再选择左侧算子、子任务。
 3. 如果原文件地址仍是 HDFS/S3 URI，设置“原 URI 前缀 → 本地目录”映射，再重新导入。工具不访问远端，不按文件名猜测映射。
-4. “状态样本”显示 schema、真实原始字节及支持的解码结果。“业务状态查询”使用 State Processor API / DataStream BATCH，填写状态名和原始类型后，在本机读取整个算子。
-5. 自定义类型/序列化器可添加原作业 JAR 及相关依赖；缺失类型会显示解析错误。标准业务查询仅支持界面列出的基本类型和默认 namespace。
+4. “状态 Schema”显示状态类型和序列化器；“数据样本”优先展示可解码的 Key、Map key、Value、Namespace、TTL 时间戳和解码结果，同时保留原始 HEX。双击单元格可查看和复制完整已返回内容；搜索和 CSV 导出针对当前读取的样本。“业务状态查询”使用 State Processor API / DataStream BATCH，填写状态名和原始类型后，在本机读取整个算子。
+5. Flink `PojoSerializer` 的对象解码可添加原作业 JAR 及相关依赖，恢复快照所记录的类型。缺失类、Kryo 或自定义序列化器可能只能返回原始 HEX 或部分解码结果，请以每行的“解码结果”为准。标准业务查询仅支持界面列出的基本类型和默认 namespace。
 
 例如，远端快照引用 `s3://bucket/checkpoints/job-id/shared/a.sst`，本地保留如下结构：
 
@@ -84,12 +84,14 @@ java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar --create-example /t
 |---|---|
 | `_metadata` | checkpoint ID、格式版本、operator hash、并行度、max parallelism、subtask handle |
 | 文件检查 | 本地路径映射、文件缺失、声明/实际大小、shared/private/meta 引用 |
-| 原始样本 | Canonical keyed snapshot（含 Snappy）、RocksDB incremental handle，每次最多 1000 条；标准 scalar 的 Value/Reducing/Aggregating 可解码，其余保留 HEX |
+| 状态样本 | Canonical keyed snapshot（含 Snappy）、RocksDB incremental handle，每次最多 1000 条；支持可识别布局的 Value/Reducing/Aggregating 和 MapState、标准 scalar、Flink PojoSerializer（需要对应作业 JAR），以及内置 TTL 包装；保留原始 HEX 和逐条解码结果 |
 | 业务查询 | State Processor API + 本地 DataStream BATCH，Value/List/Map 的标准类型、默认 namespace |
 | 原文件保护 | 文件只读；RocksDB 原始预览和业务查询在临时副本上读取/恢复，结束后清理 |
-| 导出 | 元数据报告 JSON、当前状态样本 CSV |
+| 导出 | 元数据报告 JSON、当前状态样本 CSV；样本包含 Map key、存储的 TTL 时间戳、解码结果和原始 HEX |
 
-业务查询对 native savepoint/aligned checkpoint 为实验性支持；不支持 unaligned checkpoint 的业务查询。窗口 namespace、TTL/custom serializer 的高层业务查询、changelog、状态修改、跨快照 diff、全量 SQL 和安装包尚未实现。原始预览不能将无法解码的字节解释为业务对象。
+业务查询对 native savepoint/aligned checkpoint 为实验性支持；不支持 unaligned checkpoint 的业务查询。窗口 namespace、TTL/custom serializer 的高层业务查询、changelog、状态修改、跨快照 diff、全量 SQL 和安装包尚未实现。样本解码对 Kryo、自定义序列化器、ListState 和 timer 等布局仍可能返回 `RAW`；失败或部分解码不会把未知字节解释为业务对象，原始 HEX 会继续保留。
+
+样本中的 `ttlTimestamp` 是快照实际存储的 TTL 最近访问时间，单位为毫秒；无 TTL 包装时为空。工具展示该时间戳和可解码值，不自动过滤记录，也不推断是否过期：原作业的 TTL 时长、更新策略和状态可见性配置不在快照中。MapState 的 TTL 时间戳对应具体 Map entry。
 
 Flink 1.20 `_metadata` 不包含算子名称、原始 UID、业务记录条数、checkpoint 耗时或生成时间。格式版本不等于 Flink 版本。引用状态大小可能重复计算 shared 文件，不代表去重磁盘占用。业务查询最多返回 10000 个 key；每个 key 的 List/Map 最多显示 1000 项，长文本和 HEX 会明确标记截断。样本上限不是状态总记录数，也不限制底层恢复所需的文件大小；大快照需足够的本地临时磁盘。
 
@@ -103,7 +105,7 @@ Java 17+ 的必要模块访问参数已写入 desktop JAR 的 manifest（`java.b
 mvn -B -ntp test
 ```
 
-27 个测试覆盖真实 metadata roundtrip、canonical 与 Snappy 内容、RocksDB 增量文件与 key-group 范围、本地及 S3 URI 映射后的 State Processor API 查询、缺失/截断/大小异常、取消、路径映射，以及源文件的 SHA-256/大小/mtime 保持一致。另已用打包后的 JAR 验证示例快照生成、CLI 导入和桌面导入/原始样本/业务查询。集成测试在本机启动临时 Flink MiniCluster，需要本地回环端口。
+自动化测试覆盖真实 metadata roundtrip、canonical 与 Snappy 内容、RocksDB 增量文件与 key-group 范围、本地及 S3 URI 映射后的 State Processor API 查询、缺失/截断/大小异常、取消、路径映射，以及源文件的 SHA-256/大小/mtime 保持一致。另已用打包后的 JAR 验证示例快照生成、CLI 导入和桌面导入/原始样本/业务查询。集成测试在本机启动临时 Flink MiniCluster，需要本地回环端口。
 
 ## 本地数据
 

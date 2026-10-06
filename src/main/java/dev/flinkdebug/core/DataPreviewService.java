@@ -99,7 +99,9 @@ public final class DataPreviewService {
         checkCancelled();
         if (state.getManagedKeyedState().isEmpty()) sample.warn("This subtask has no managed keyed state.");
         if (sample.truncated) sample.warn("This is a bounded sample, not a complete entry count.");
-        sample.warn("Hex values show at most 2048 bytes per field; long text is shortened explicitly. Custom/TTL/list/map/timer layouts stay raw.");
+        if (sample.entries.stream().anyMatch(entry -> entry.ttlTimestamp() != null)) {
+            sample.warn("TTL timestamps are stored last-access times, not expiration times. Entries are not filtered: retention and visibility policy are not available from the serializer snapshot.");
+        }
         return sample.report();
     }
 
