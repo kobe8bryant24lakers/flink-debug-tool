@@ -44,6 +44,8 @@ class SnapshotInspectorTest {
             var operator = report.operators().get(0);
             assertEquals(1, operator.parallelism());
             assertEquals(128, operator.maxParallelism());
+            assertNull(operator.operatorName());
+            assertNull(operator.operatorUid());
             assertEquals(3, report.files().size());
             assertEquals("PRESENT", report.files().stream()
                     .filter(file -> file.category().endsWith("/shared")).findFirst().orElseThrow()
@@ -54,6 +56,31 @@ class SnapshotInspectorTest {
         }
         assertArrayEquals(metadataBytes, Files.readAllBytes(metadata));
         assertArrayEquals(stateBytes, Files.readAllBytes(stateFile));
+    }
+
+    @Test void readsOptionalLabelsWhenTheOperatorMetadataApiProvidesThem() {
+        OperatorState named = new NamedOperator();
+        assertEquals("fixture-process", SnapshotInspector.operatorText(named, "getOperatorName"));
+        assertEquals("fixture-process-v1", SnapshotInspector.operatorText(named, "getOperatorUid"));
+        assertNull(SnapshotInspector.operatorText(named, "missingGetter"));
+    }
+
+    @Test void missingOrBlankLabelsRemainUnknown() {
+        OperatorState unnamed = new UnnamedOperator();
+        assertNull(SnapshotInspector.operatorText(unnamed, "getOperatorName"));
+        assertNull(SnapshotInspector.operatorText(unnamed, "getOperatorUid"));
+    }
+
+    public static final class NamedOperator extends OperatorState {
+        public NamedOperator() { super(new OperatorID(11, 12), 2, 128); }
+        public java.util.Optional<String> getOperatorName() { return java.util.Optional.of("fixture-process"); }
+        public java.util.Optional<String> getOperatorUid() { return java.util.Optional.of("fixture-process-v1"); }
+    }
+
+    public static final class UnnamedOperator extends OperatorState {
+        public UnnamedOperator() { super(new OperatorID(13, 14), 2, 128); }
+        public java.util.Optional<String> getOperatorName() { return java.util.Optional.empty(); }
+        public java.util.Optional<String> getOperatorUid() { return java.util.Optional.of("  "); }
     }
 
     @Test void missingStateDoesNotPreventMetadataInspection() throws Exception {

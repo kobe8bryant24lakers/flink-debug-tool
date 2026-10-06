@@ -138,7 +138,8 @@ public final class SnapshotInspector {
             }
             operators.add(new SnapshotReport.OperatorReport(operatorId, operator.getParallelism(),
                     operator.getMaxParallelism(), operator.getStateSize(),
-                    operator.getCheckpointedSize(), operator.isFullyFinished(), List.copyOf(subtasks)));
+                    operator.getCheckpointedSize(), operator.isFullyFinished(), List.copyOf(subtasks),
+                    operatorText(operator, "getOperatorName"), operatorText(operator, "getOperatorUid")));
             referencedBytes += operator.getStateSize();
             checkpointedBytes += operator.getCheckpointedSize();
         }
@@ -166,6 +167,17 @@ public final class SnapshotInspector {
         return new SnapshotReport(metadataPath, EnvironmentInformation.getVersion(), formatVersion,
                 metadata.getCheckpointId(), kind, referencedBytes, checkpointedBytes,
                 List.copyOf(operators), List.copyOf(stateFiles), List.copyOf(diagnostics));
+    }
+
+    /** Newer metadata carries labels; Flink 1.20 has no such API or saved fields. */
+    static String operatorText(OperatorState operator, String getter) {
+        try {
+            Object value = operator.getClass().getMethod(getter).invoke(operator);
+            if (value instanceof java.util.Optional<?> optional) value = optional.orElse(null);
+            return value instanceof String text && !text.isBlank() ? text : null;
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError unavailable) {
+            return null;
+        }
     }
 
     private void addKeyed(String operator, int subtask, String category, KeyedStateHandle handle,

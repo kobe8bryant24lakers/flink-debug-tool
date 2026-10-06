@@ -19,6 +19,7 @@ import javax.swing.table.DefaultTableModel;
 import javax.swing.table.TableRowSorter;
 import javax.swing.tree.DefaultMutableTreeNode;
 import javax.swing.tree.DefaultTreeModel;
+import javax.swing.tree.DefaultTreeCellRenderer;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -282,10 +283,21 @@ public final class StateLensFrame extends JFrame {
     private JComponent workspace() {
         JPanel navigation = card();
         navigation.setLayout(new BorderLayout(0, 8));
-        navigation.add(new JLabel("算子 / 子任务"), BorderLayout.NORTH);
+        navigation.add(new JLabel("算子 / 子任务（并行实例）"), BorderLayout.NORTH);
         operatorTree.setRootVisible(true);
         operatorTree.setShowsRootHandles(true);
         operatorTree.setRowHeight(28);
+        operatorTree.setCellRenderer(new DefaultTreeCellRenderer() {
+            @Override public Component getTreeCellRendererComponent(JTree tree, Object value, boolean selected,
+                                                                     boolean expanded, boolean leaf, int row,
+                                                                     boolean hasFocus) {
+                Component component = super.getTreeCellRendererComponent(tree, value, selected, expanded, leaf, row, hasFocus);
+                setToolTipText(value instanceof DefaultMutableTreeNode node && node.getUserObject() instanceof TreeItem item
+                        ? item.identityTooltip() : null);
+                return component;
+            }
+        });
+        ToolTipManager.sharedInstance().registerComponent(operatorTree);
         navigation.add(new JScrollPane(operatorTree), BorderLayout.CENTER);
         selectionSummary.setForeground(MUTED);
         navigation.add(selectionSummary, BorderLayout.SOUTH);
@@ -559,9 +571,14 @@ public final class StateLensFrame extends JFrame {
         report.diagnostics().forEach(d -> diagnosticsModel.addRow(new Object[]{d.severity(), d.message()}));
         DefaultMutableTreeNode root = new DefaultMutableTreeNode("快照 " + report.checkpointId());
         for (SnapshotReport.OperatorReport operator : report.operators()) {
-            DefaultMutableTreeNode node = new DefaultMutableTreeNode(new TreeItem(operator.operatorId(), -1, "算子 " + operator.operatorId()));
+            String identity = operatorIdentity(operator);
+            DefaultMutableTreeNode node = new DefaultMutableTreeNode(new TreeItem(operator.operatorId(), -1,
+                    operatorLabel(operator), identity));
             for (SnapshotReport.SubtaskReport subtask : operator.subtasks()) {
-                node.add(new DefaultMutableTreeNode(new TreeItem(operator.operatorId(), subtask.index(), "子任务 " + subtask.index() + " · " + bytes(subtask.referencedStateBytes()))));
+                String instance = "子任务 " + subtask.index() + "/" + operator.parallelism();
+                node.add(new DefaultMutableTreeNode(new TreeItem(operator.operatorId(), subtask.index(),
+                        instance + " · " + bytes(subtask.referencedStateBytes()),
+                        identity.replace("</html>", "<br>" + instance + "（并行实例序号 / 并行度）</html>"))));
             }
             root.add(node);
         }
@@ -570,6 +587,7 @@ public final class StateLensFrame extends JFrame {
         operatorTree.setSelectionRow(0);
         selected = null;
         selectionSummary.setText("全部状态文件");
+        selectionSummary.setToolTipText(null);
         renderFiles();
         clearPreview();
         clearQuery();
@@ -580,10 +598,14 @@ public final class StateLensFrame extends JFrame {
         DefaultMutableTreeNode node = (DefaultMutableTreeNode) operatorTree.getLastSelectedPathComponent();
         selected = node != null && node.getUserObject() instanceof TreeItem item ? item : null;
         selectionSummary.setText(selected == null ? "全部状态文件" : selected.subtask() < 0 ? "选择子任务以读取数据" : "子任务 " + selected.subtask());
+        selectionSummary.setToolTipText(selected == null ? null : selected.identityTooltip());
         if (selected != null && report != null) {
             report.operators().stream().filter(op -> op.operatorId().equals(selected.operatorId())).findFirst().ifPresent(op -> {
-                selectionSummary.setText("<html>并行度 " + op.parallelism() + " / 最大 " + op.maxParallelism() + "<br>"
-                        + (selected.subtask() < 0 ? "选择子任务以读取原始数据" : "已选择子任务 " + selected.subtask())
+                selectionSummary.setText("<html>名称：" + html(shortText(identityField(op.operatorName()), 24))
+                        + "<br>UID：" + html(shortText(identityField(op.operatorUid()), 24))
+                        + "<br>Hash：" + html(shortHash(op.operatorId()))
+                        + "<br>并行度 " + op.parallelism() + " / 最大 " + op.maxParallelism() + "<br>"
+                        + (selected.subtask() < 0 ? "选择子任务以读取原始数据" : "已选子任务 " + selected.subtask() + "/" + op.parallelism() + "（并行实例）")
                         + (op.fullyFinished() ? "<br>算子已全部完成" : "") + "</html>");
             });
         }
@@ -952,6 +974,35 @@ public final class StateLensFrame extends JFrame {
         return value.equals(status) || value.startsWith(status + ":");
     }
 
+    private static String operatorLabel(SnapshotReport.OperatorReport operator) {
+        if (operator.operatorName() != null && !operator.operatorName().isBlank()) return "算子 · " + operator.operatorName();
+        if (operator.operatorUid() != null && !operator.operatorUid().isBlank()) return "UID · " + operator.operatorUid();
+        return "未命名算子 · " + shortHash(operator.operatorId());
+    }
+
+    private static String operatorIdentity(SnapshotReport.OperatorReport operator) {
+        return "<html>名称：" + html(identityField(operator.operatorName()))
+                + "<br>UID：" + html(identityField(operator.operatorUid()))
+                + "<br>Hash：" + html(operator.operatorId()) + "</html>";
+    }
+
+    private static String identityField(String value) {
+        return value == null || value.isBlank() ? "未记录" : value;
+    }
+
+    private static String shortHash(String value) {
+        return shortText(Objects.toString(value, ""), 8);
+    }
+
+    private static String shortText(String value, int maximum) {
+        return value.length() <= maximum ? value : value.substring(0, maximum) + "…";
+    }
+
+    private static String html(String value) {
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;").replace("'", "&#39;");
+    }
+
     static String shortSnapshotKind(String kind) {
         if (kind == null || kind.isBlank() || "UNKNOWN".equalsIgnoreCase(kind.trim())) return "未记录";
         String value = kind.trim();
@@ -1083,7 +1134,7 @@ public final class StateLensFrame extends JFrame {
         writer.write("\r\n");
     }
 
-    private record TreeItem(String operatorId, int subtask, String label) {
+    private record TreeItem(String operatorId, int subtask, String label, String identityTooltip) {
         @Override public String toString() { return label; }
     }
 

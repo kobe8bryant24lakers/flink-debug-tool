@@ -10,7 +10,8 @@ public record SnapshotReport(Path metadataPath, String runtimeVersion, int metad
                              List<StateFile> files, List<Diagnostic> diagnostics) {
     public record OperatorReport(String operatorId, int parallelism, int maxParallelism,
                                  long referencedStateBytes, long checkpointedBytes,
-                                 boolean fullyFinished, List<SubtaskReport> subtasks) {}
+                                 boolean fullyFinished, List<SubtaskReport> subtasks,
+                                 String operatorName, String operatorUid) {}
     public record SubtaskReport(int index, long referencedStateBytes, long checkpointedBytes,
                                 List<String> handleTypes, int keyedHandleCount, int operatorHandleCount) {}
     public record StateFile(String operatorId, int subtask, String category, String handleType,

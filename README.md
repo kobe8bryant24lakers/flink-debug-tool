@@ -38,7 +38,7 @@ mvn -B -ntp -Dmaven.repo.local=.maven-repo package
 ## 使用流程
 
 1. 手动下载快照及其引用的全部状态文件。增量 RocksDB checkpoint 往往需要 job 目录下的 `shared` 文件，单独下载 `chk-N/_metadata` 不够。
-2. 打开快照目录或 `_metadata` 文件。先查看文件完整性，再选择左侧算子、子任务。
+2. 打开快照目录或 `_metadata` 文件。先查看文件完整性，再选择左侧算子、子任务。树中优先显示元数据中的算子名称，其次为 UID；缺失时显示“未命名算子”和短 hash。悬停可查看完整名称、UID 和 operator hash。
 3. 如果原文件地址仍是 HDFS/S3 URI，设置“原 URI 前缀 → 本地目录”映射，再重新导入。工具不访问远端，不按文件名猜测映射。
 4. “状态 Schema”显示状态类型和序列化器；“数据样本”优先展示可解码的 Key、Map key、Value、Namespace、TTL 时间戳和解码结果，同时保留原始 HEX。双击单元格可查看和复制完整已返回内容；搜索和 CSV 导出针对当前读取的样本。“业务状态查询”使用 State Processor API / DataStream BATCH，填写状态名和原始类型后，在本机读取整个算子。
 5. Flink `PojoSerializer` 的对象解码可添加原作业 JAR 及相关依赖，恢复快照所记录的类型。缺失类、Kryo 或自定义序列化器可能只能返回原始 HEX 或部分解码结果，请以每行的“解码结果”为准。标准业务查询仅支持界面列出的基本类型和默认 namespace。
@@ -82,7 +82,7 @@ java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar --create-example /t
 
 | 功能 | 能力 |
 |---|---|
-| `_metadata` | checkpoint ID、格式版本、operator hash、并行度、max parallelism、subtask handle |
+| `_metadata` | checkpoint ID、格式版本、operator hash、并行度、max parallelism、subtask handle；元数据实际保存名称/UID 且运行时 API 可读取时显示名称/UID |
 | 文件检查 | 本地路径映射、文件缺失、声明/实际大小、shared/private/meta 引用 |
 | 状态样本 | Canonical keyed snapshot（含 Snappy）、RocksDB incremental handle，每次最多 1000 条；支持可识别布局的 Value/Reducing/Aggregating 和 MapState、标准 scalar、Flink PojoSerializer（需要对应作业 JAR），以及内置 TTL 包装；保留原始 HEX 和逐条解码结果 |
 | 业务查询 | State Processor API + 本地 DataStream BATCH，Value/List/Map 的标准类型、默认 namespace |
@@ -93,7 +93,11 @@ java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar --create-example /t
 
 样本中的 `ttlTimestamp` 是快照实际存储的 TTL 最近访问时间，单位为毫秒；无 TTL 包装时为空。工具展示该时间戳和可解码值，不自动过滤记录，也不推断是否过期：原作业的 TTL 时长、更新策略和状态可见性配置不在快照中。MapState 的 TTL 时间戳对应具体 Map entry。
 
-Flink 1.20 `_metadata` 不包含算子名称、原始 UID、业务记录条数、checkpoint 耗时或生成时间。格式版本不等于 Flink 版本。引用状态大小可能重复计算 shared 文件，不代表去重磁盘占用。业务查询最多返回 10000 个 key；每个 key 的 List/Map 最多显示 1000 项，长文本和 HEX 会明确标记截断。样本上限不是状态总记录数，也不限制底层恢复所需的文件大小；大快照需足够的本地临时磁盘。
+算子名称和 UID 的显示取决于快照保存的信息。Flink 1.20 `_metadata` 不包含这两个字段，无法从 operator hash 逆推出名称或原始 UID；较新格式（如 Flink 2.2）实际保存这两个字段、且运行时 API 可读取时，界面会显示它们。添加作业 JAR 用于恢复状态类型，工具不会运行作业 main 或猜测 UID。默认项目依赖仍为 Flink 1.20.5，这一展示能力不代表正式支持 Flink 2.2 快照解析。
+
+子任务是同一算子的并行实例，没有独立业务名称。“子任务 0/2”表示并行度为 2 的算子中的第 0 个实例，编号从 0 开始；完整 operator hash 仍用于筛选和导出定位。
+
+Flink 1.20 `_metadata` 也不包含业务记录条数、checkpoint 耗时或生成时间。格式版本不等于 Flink 版本。引用状态大小可能重复计算 shared 文件，不代表去重磁盘占用。业务查询最多返回 10000 个 key；每个 key 的 List/Map 最多显示 1000 项，长文本和 HEX 会明确标记截断。样本上限不是状态总记录数，也不限制底层恢复所需的文件大小；大快照需足够的本地临时磁盘。
 
 Java 17+ 的必要模块访问参数已写入 desktop JAR 的 manifest（`java.base/java.util`），直接 `java -jar` 启动即可。若直接用 IDE/classpath 启动包含 Flink 作业的功能，请设置 JVM 参数 `--add-opens=java.base/java.util=ALL-UNNAMED`。
 
