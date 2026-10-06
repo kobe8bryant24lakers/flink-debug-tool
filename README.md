@@ -19,6 +19,14 @@ java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar --open /data/savepo
 
 也可以省略 `--open`，直接将快照路径作为唯一参数。
 
+`--open` 可同时使用 `--map` 和 `--jar`，在导入时预先设置本地路径映射与原作业依赖：
+
+```sh
+java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar \
+  --open /data/job-id/chk-42 \
+  --map 's3://bucket/checkpoints/job-id=/data/job-id' --jar /data/job.jar
+```
+
 首次构建需要下载依赖；打包后的桌面 JAR 包含依赖，可离线运行。无需连接生产 Flink 集群。
 
 如果使用项目内依赖缓存：

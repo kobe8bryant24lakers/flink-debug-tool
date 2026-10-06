@@ -162,7 +162,7 @@ public final class SnapshotInspector {
         diagnostics.add(new SnapshotReport.Diagnostic("INFO",
                 "状态大小来自 metadata 中的 handle 引用，可能重复引用共享文件；不是业务记录数或去重磁盘占用。"));
         diagnostics.add(new SnapshotReport.Diagnostic("INFO",
-                "metadata 格式版本不代表生成快照的 Flink 版本；Flink 1.20 metadata 不包含原始 UID、算子名称和 checkpoint 耗时。"));
+                "metadata 格式版本不代表生成快照的 Flink 版本；页面显示的是解析器运行时版本。"));
         return new SnapshotReport(metadataPath, EnvironmentInformation.getVersion(), formatVersion,
                 metadata.getCheckpointId(), kind, referencedBytes, checkpointedBytes,
                 List.copyOf(operators), List.copyOf(stateFiles), List.copyOf(diagnostics));

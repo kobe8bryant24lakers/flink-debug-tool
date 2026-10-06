@@ -3,6 +3,7 @@ package dev.flinkdebug;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.flinkdebug.core.*;
 import dev.flinkdebug.ui.StateLensFrame;
+import org.apache.flink.runtime.util.EnvironmentInformation;
 
 import javax.swing.*;
 import java.awt.GraphicsEnvironment;
@@ -22,9 +23,17 @@ public final class Main {
                 return;
             }
             if (args[0].equals("--open")) {
-                if (args.length != 2 || args[1].isBlank() || args[1].startsWith("--"))
+                if (args.length < 2 || args[1].isBlank() || args[1].startsWith("--"))
                     throw new IllegalArgumentException("--open 格式: --open /path/to/snapshot");
-                launchDesktop(Path.of(args[1]));
+                var mappings = new ArrayList<PathMapping>();
+                var jars = new ArrayList<Path>();
+                for (int i = 2; i < args.length; i += 2) {
+                    if (i + 1 == args.length) throw new IllegalArgumentException("缺少桌面启动选项参数: " + args[i]);
+                    if (args[i].equals("--map")) mappings.add(pathMapping(args[i + 1]));
+                    else if (args[i].equals("--jar")) jars.add(Path.of(args[i + 1]));
+                    else throw new IllegalArgumentException("桌面启动仅支持 --map 和 --jar: " + args[i]);
+                }
+                launchDesktop(Path.of(args[1]), mappings, jars);
                 return;
             }
             if (args.length == 1 && !args[0].startsWith("--")) {
@@ -45,6 +54,10 @@ public final class Main {
     }
 
     private static void launchDesktop(Path snapshot) {
+        launchDesktop(snapshot, List.of(), List.of());
+    }
+
+    private static void launchDesktop(Path snapshot, List<PathMapping> mappings, List<Path> jars) {
         if (GraphicsEnvironment.isHeadless()) throw new IllegalArgumentException("当前环境无桌面，可使用 --inspect、--preview 或 --query。");
         SwingUtilities.invokeLater(() -> {
             try {
@@ -54,7 +67,7 @@ public final class Main {
             } catch (Exception ignored) { /* System theme is sufficient. */ }
             var frame = new StateLensFrame();
             frame.setVisible(true);
-            if (snapshot != null) frame.openSnapshot(snapshot);
+            if (snapshot != null) frame.openSnapshot(snapshot, mappings, jars);
         });
     }
 
@@ -68,9 +81,7 @@ public final class Main {
             if (!allowed.contains(name) || i + 1 == args.length) throw new IllegalArgumentException("未知选项或缺少参数: " + name);
             String value = args[i + 1];
             if (name.equals("--map")) {
-                int split = value.indexOf('=');
-                if (split < 1 || split == value.length() - 1) throw new IllegalArgumentException("--map 格式: 原URI前缀=/本地目录");
-                mappings.add(new PathMapping(value.substring(0, split), Path.of(value.substring(split + 1))));
+                mappings.add(pathMapping(value));
             } else if (name.equals("--jar")) jars.add(Path.of(value));
             else if (options.put(name, value) != null) throw new IllegalArgumentException("重复选项: " + name);
         }
@@ -91,6 +102,12 @@ public final class Main {
         }
     }
 
+    private static PathMapping pathMapping(String value) {
+        int split = value.indexOf('=');
+        if (split < 1 || split == value.length() - 1) throw new IllegalArgumentException("--map 格式: 原URI前缀=/本地目录");
+        return new PathMapping(value.substring(0, split), Path.of(value.substring(split + 1)));
+    }
+
     private static String required(Map<String, String> options, String key) {
         String value = options.get(key);
         if (value == null || value.isBlank()) throw new IllegalArgumentException("缺少参数: " + key);
@@ -103,9 +120,10 @@ public final class Main {
 
     private static void usage() {
         System.out.println("""
-                Flink State Lens · Flink 1.20 离线状态分析
+                Flink State Lens · Flink %s 离线状态分析
                 无参数: 打开桌面界面
                 --open /path/to/snapshot: 打开桌面界面并自动导入快照（也可直接传入快照路径）
+                    可同时指定 --map 和 --jar，预先设置本地路径映射和原作业类型
                 --inspect /path/to/snapshot: 元数据与状态文件完整性 JSON
                 --preview /path/to/snapshot --operator HASH [--subtask 0] [--limit 200]: 原始状态与可解码样本 JSON
                 --query /path/to/snapshot --operator HASH --state NAME [--kind VALUE|LIST|MAP]
@@ -115,6 +133,6 @@ public final class Main {
                 --jar /path/to/job.jar: 可重复添加原作业/依赖 JAR
                 --create-example /new/output/directory: 使用 Flink 生成可分析的示例 savepoint（目录必须尚不存在）
                 样本限制 1–10000；checkpoint 须同时下载全部 shared/private/meta 引用文件。
-                """);
+                """.formatted(EnvironmentInformation.getVersion()));
     }
 }
