@@ -20,6 +20,7 @@ import javax.swing.table.TableRowSorter;
 import javax.swing.tree.DefaultMutableTreeNode;
 import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.DefaultTreeCellRenderer;
+import javax.swing.tree.TreePath;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -74,6 +75,7 @@ public final class StateLensFrame extends JFrame {
     private final JTable diagnosticsTable = table(diagnosticsModel);
     private final TableRowSorter<DefaultTableModel> sampleSorter = new TableRowSorter<>(samplesModel);
     private final JTextField sampleSearch = new JTextField();
+    private final JLabel schemaSummary = new JLabel("请选择具体子任务，然后点击“读取样本”加载状态 Schema。");
     private final JLabel sampleSummary = new JLabel("未读取状态数据。请选择具体子任务，然后点击“读取样本”。");
     private final JTabbedPane details = new JTabbedPane();
     private final JTextField queryStateName = new JTextField();
@@ -309,7 +311,7 @@ public final class StateLensFrame extends JFrame {
         details.addTab("状态文件", new JScrollPane(filesTable));
         schemasTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
         for (int i = 0; i < schemasTable.getColumnCount(); i++) schemasTable.getColumnModel().getColumn(i).setPreferredWidth(i < 2 ? 170 : 300);
-        details.addTab("状态 Schema", new JScrollPane(schemasTable));
+        details.addTab("状态 Schema", schemasPanel());
         details.addTab("数据样本", samplesPanel());
         details.addTab("业务状态查询", queryPanel());
         diagnosticsTable.getColumnModel().getColumn(0).setPreferredWidth(80);
@@ -325,6 +327,15 @@ public final class StateLensFrame extends JFrame {
         split.setDividerLocation(250);
         split.setContinuousLayout(true);
         return split;
+    }
+
+    private JPanel schemasPanel() {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(new EmptyBorder(8, 8, 8, 8));
+        schemaSummary.setForeground(MUTED);
+        panel.add(schemaSummary, BorderLayout.NORTH);
+        panel.add(new JScrollPane(schemasTable), BorderLayout.CENTER);
+        return panel;
     }
 
     private JPanel samplesPanel() {
@@ -596,7 +607,10 @@ public final class StateLensFrame extends JFrame {
     private void selectTreeNode() {
         if (busy || closing) return;
         DefaultMutableTreeNode node = (DefaultMutableTreeNode) operatorTree.getLastSelectedPathComponent();
-        selected = node != null && node.getUserObject() instanceof TreeItem item ? item : null;
+        TreeItem next = node != null && node.getUserObject() instanceof TreeItem item ? item : null;
+        if (Objects.equals(selected, next)) return;
+        selected = next;
+        if (selected != null && selected.subtask() < 0) operatorTree.expandPath(new TreePath(node.getPath()));
         selectionSummary.setText(selected == null ? "全部状态文件" : selected.subtask() < 0 ? "选择子任务以读取数据" : "子任务 " + selected.subtask());
         selectionSummary.setToolTipText(selected == null ? null : selected.identityTooltip());
         if (selected != null && report != null) {
@@ -613,6 +627,9 @@ public final class StateLensFrame extends JFrame {
         clearPreview();
         clearQuery();
         updateActions();
+        setStatus(selected == null ? "未读取 · 请选择算子和具体子任务"
+                : selected.subtask() < 0 ? "未读取 · 已展开算子，请选择具体子任务并点击“读取样本”"
+                : "未读取 · 已选择子任务 " + selected.subtask() + "，点击“读取样本”加载 Schema 和数据", "INFO");
     }
 
     private void renderFiles() {
@@ -629,14 +646,32 @@ public final class StateLensFrame extends JFrame {
         preview = null;
         schemasModel.setRowCount(0);
         samplesModel.setRowCount(0);
-        sampleSummary.setText("未读取状态数据。请选择具体子任务，然后点击“读取样本”。");
-        sampleSummary.setToolTipText(null);
+        String message = session == null ? "尚未加载快照。导入快照后，选择具体子任务并点击“读取样本”。"
+                : selected == null ? "未读取：请选择算子，再选择具体子任务并点击“读取样本”。"
+                : selected.subtask() < 0 ? "未读取：当前选择的是算子。请选择其下的具体子任务，再点击“读取样本”。"
+                : "未读取：当前子任务的 Schema 和样本尚未加载。点击“读取样本”开始读取。";
+        setPreviewMessage(message);
         details.setTitleAt(1, "状态 Schema");
         details.setTitleAt(2, "数据样本");
         if (report != null) {
             diagnosticsModel.setRowCount(0);
             report.diagnostics().forEach(d -> diagnosticsModel.addRow(new Object[]{d.severity(), d.message()}));
         }
+    }
+
+    private void setPreviewMessage(String message) {
+        schemaSummary.setText(message);
+        schemaSummary.setToolTipText(message);
+        schemaSummary.setForeground(MUTED);
+        sampleSummary.setText(message);
+        sampleSummary.setToolTipText(message);
+        sampleSummary.setForeground(MUTED);
+    }
+
+    private void previewCancelled() {
+        clearPreview();
+        setPreviewMessage("读取已取消，当前子任务的 Schema 和样本尚未加载。点击“读取样本”可重试。");
+        setStatus("样本读取已取消 · 可点击“读取样本”重试", "INFO");
     }
 
     private void loadPreview() {
@@ -647,6 +682,7 @@ public final class StateLensFrame extends JFrame {
         TreeItem readingSelection = selected;
         int sampleLimit = (Integer) limit.getValue();
         long request = generation;
+        setPreviewMessage("正在读取当前子任务的 Schema 和有界样本…" + (preview == null ? "" : " 表格暂时保留上次结果。"));
         beginOperation("正在读取 RocksDB 状态，最多 " + sampleLimit + " 条…", true);
         new SwingWorker<PreviewReport, Void>() {
             @Override protected PreviewReport doInBackground() throws Exception {
@@ -655,16 +691,25 @@ public final class StateLensFrame extends JFrame {
             @Override protected void done() {
                 try {
                     PreviewReport result = get();
-                    if (cancellationRequested) { clearPreview(); setStatus("样本读取已取消", "INFO"); return; }
+                    if (cancellationRequested) { previewCancelled(); return; }
                     if (request != generation || reading != session || !readingSelection.equals(selected)) return;
                     preview = result;
                     renderPreview();
                     details.setSelectedIndex(2);
-                    setStatus(result.warnings().isEmpty() ? "读取完成 · 已返回 " + result.entries().size() + " 条样本" : "读取完成 · " + result.warnings().size() + " 条警告，详见“诊断”页", result.warnings().isEmpty() ? "INFO" : "WARN");
+                    setStatus(result.warnings().isEmpty() ? result.entries().isEmpty()
+                                    ? "读取完成 · 当前子任务未返回样本，可查看 Schema 或选择其他子任务"
+                                    : "读取完成 · 已返回 " + result.entries().size() + " 条样本"
+                            : "读取返回 " + result.entries().size() + " 条样本 · " + result.warnings().size() + " 条警告，请查看“诊断”页确认原因",
+                            result.warnings().isEmpty() ? "INFO" : "WARN");
                 } catch (Exception error) {
                     clearPreview();
-                    if (cancellationRequested) setStatus("样本读取已取消", "INFO");
-                    else showFailure("样本读取失败", unwrap(error));
+                    if (cancellationRequested) previewCancelled();
+                    else {
+                        setPreviewMessage("读取失败，未加载当前子任务的 Schema 和样本。请查看“诊断”页中的错误原因并重试。");
+                        schemaSummary.setForeground(new Color(174, 45, 55));
+                        sampleSummary.setForeground(new Color(174, 45, 55));
+                        showFailure("样本读取失败", unwrap(error));
+                    }
                 } finally { endOperation(); }
             }
         }.execute();
@@ -680,6 +725,11 @@ public final class StateLensFrame extends JFrame {
         preview.warnings().forEach(w -> diagnosticsModel.addRow(new Object[]{"WARN", w}));
         details.setTitleAt(1, "状态 Schema（" + preview.schemas().size() + "）");
         details.setTitleAt(2, "数据样本（" + preview.entries().size() + "）");
+        String warnings = preview.warnings().isEmpty() ? "" : " · " + preview.warnings().size() + " 条警告，请查看“诊断”页确认原因";
+        schemaSummary.setText(preview.schemas().isEmpty()
+                ? "本次未返回可展示的状态 Schema" + warnings + "；这不表示算子没有状态。"
+                : "已读取当前子任务的 " + preview.schemas().size() + " 个状态 Schema" + warnings);
+        schemaSummary.setToolTipText(schemaSummary.getText());
         long decoded = preview.entries().stream().filter(entry -> hasDecodeStatus(entry, "DECODED")).count();
         long partial = preview.entries().stream().filter(entry -> hasDecodeStatus(entry, "PARTIAL")).count();
         long raw = preview.entries().size() - decoded - partial;
@@ -687,6 +737,12 @@ public final class StateLensFrame extends JFrame {
                 + " · 原始/失败 " + raw + (preview.truncated() ? " · 已截断" : "")
                 + "；样本不代表状态总记录数。TTL 为存储的访问时间戳，不判断过期。HEX 可横向滚动/双击查看。");
         sampleSummary.setToolTipText(sampleSummary.getText());
+        if (preview.entries().isEmpty()) {
+            sampleSummary.setText(preview.warnings().isEmpty()
+                    ? "读取成功，当前子任务未返回样本；其他子任务需分别选择和读取。"
+                    : "当前子任务未返回样本" + warnings + "；可能包含未支持的状态类型或读取失败，请以诊断为准。");
+            sampleSummary.setToolTipText(sampleSummary.getText());
+        }
         filterSamples();
     }
 

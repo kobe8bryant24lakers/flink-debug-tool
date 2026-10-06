@@ -40,7 +40,7 @@ mvn -B -ntp -Dmaven.repo.local=.maven-repo package
 1. 手动下载快照及其引用的全部状态文件。增量 RocksDB checkpoint 往往需要 job 目录下的 `shared` 文件，单独下载 `chk-N/_metadata` 不够。
 2. 打开快照目录或 `_metadata` 文件。先查看文件完整性，再选择左侧算子、子任务。树中优先显示元数据中的算子名称，其次为 UID；缺失时显示“未命名算子”和短 hash。悬停可查看完整名称、UID 和 operator hash。
 3. 如果原文件地址仍是 HDFS/S3 URI，设置“原 URI 前缀 → 本地目录”映射，再重新导入。工具不访问远端，不按文件名猜测映射。
-4. “状态 Schema”显示状态类型和序列化器；“数据样本”优先展示可解码的 Key、Map key、Value、Namespace、TTL 时间戳和解码结果，同时保留原始 HEX。双击单元格可查看和复制完整已返回内容；搜索和 CSV 导出针对当前读取的样本。“业务状态查询”使用 State Processor API / DataStream BATCH，填写状态名和原始类型后，在本机读取整个算子。
+4. 点击算子会展开子任务，并展示该算子的文件引用。**选择具体子任务，再点击“读取样本”**，才会同时加载“状态 Schema”和“数据样本”；两个页签会区分未读取、读取中、取消、失败和零结果，读取警告可在“诊断”页查看。切换算子/子任务会清除上一选择的结果，重复选择同一节点会保留已读结果。“状态 Schema”显示状态类型和序列化器；“数据样本”优先展示可解码的 Key、Map key、Value、Namespace、TTL 时间戳和解码结果，同时保留原始 HEX。双击单元格可查看和复制完整已返回内容；搜索和 CSV 导出针对当前读取的样本。“业务状态查询”使用 State Processor API / DataStream BATCH，填写状态名和原始类型后，在本机读取整个算子。
 5. Flink `PojoSerializer` 的对象解码可添加原作业 JAR 及相关依赖，恢复快照所记录的类型。缺失类、Kryo 或自定义序列化器可能只能返回原始 HEX 或部分解码结果，请以每行的“解码结果”为准。标准业务查询仅支持界面列出的基本类型和默认 namespace。
 
 例如，远端快照引用 `s3://bucket/checkpoints/job-id/shared/a.sst`，本地保留如下结构：
