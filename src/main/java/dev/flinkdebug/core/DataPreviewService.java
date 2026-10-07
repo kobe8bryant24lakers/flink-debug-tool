@@ -44,13 +44,18 @@ import static org.apache.flink.runtime.state.FullSnapshotUtil.END_OF_KEY_GROUP_M
 import static org.apache.flink.runtime.state.FullSnapshotUtil.clearMetaDataFollowsFlag;
 import static org.apache.flink.runtime.state.FullSnapshotUtil.hasMetaDataFollowsFlag;
 
-/** Reads a bounded sample directly from downloaded files; never restores a running Flink job. */
+/** Reads filtered pages directly from downloaded files; never restores a running Flink job. */
 public final class DataPreviewService {
     public static final int MAX_ENTRIES = 1000;
+    private static final long MAX_PAGE_BYTES = 32L * 1024 * 1024;
 
     public PreviewReport preview(SnapshotSession session, String operatorId, int subtask, int limit) throws Exception {
+        return preview(session, operatorId, subtask, new PreviewRequest(limit, 0, null, null, null, null, null, null));
+    }
+
+    public PreviewReport preview(SnapshotSession session, String operatorId, int subtask, PreviewRequest request) throws Exception {
         if (session == null) throw new IllegalArgumentException("Open a snapshot first");
-        if (limit <= 0) throw new IllegalArgumentException("Sample limit must be positive");
+        if (request == null) throw new IllegalArgumentException("Specify a page request");
         checkCancelled();
         OperatorState operator = session.metadata().getOperatorStates().stream()
                 .filter(state -> state.getOperatorID().toHexString().equalsIgnoreCase(operatorId))
@@ -58,61 +63,90 @@ public final class DataPreviewService {
         if (subtask < 0 || subtask >= operator.getParallelism()) {
             throw new IllegalArgumentException("Subtask must be between 0 and " + (operator.getParallelism() - 1));
         }
-        Sample sample = new Sample(Math.min(limit, MAX_ENTRIES));
-        if (limit > MAX_ENTRIES) sample.warn("Sample limit capped at " + MAX_ENTRIES + " entries.");
+        Sample sample = new Sample(request);
         OperatorSubtaskState state = operator.getState(subtask);
         if (state == null) {
             sample.warn("This subtask has no saved state.");
             return sample.report();
         }
-        if (!state.getRawKeyedState().isEmpty()) sample.warn("Raw keyed state is not decoded; managed keyed state is sampled only.");
+        if (!state.getRawKeyedState().isEmpty()) sample.incomplete("Raw keyed state is not decoded; this reader covers managed keyed state only.");
         if (!state.getManagedOperatorState().isEmpty() || !state.getRawOperatorState().isEmpty()) {
-            sample.warn("Operator/list/broadcast state payloads are not sampled by this keyed-state reader.");
+            sample.incomplete("Operator/list/broadcast state payloads are not read by this keyed-state reader.");
         }
         if (!state.getInputChannelState().isEmpty() || !state.getResultSubpartitionState().isEmpty()) {
-            sample.warn("Unaligned checkpoint channel buffers are not business state and are not decoded.");
+            sample.incomplete("Unaligned checkpoint channel buffers are not business state and are not decoded.");
         }
         int prefixBytes = computeRequiredBytesInKeyGroupPrefix(operator.getMaxParallelism());
+        // Catalog every handle before collecting rows. A large first state must not hide
+        // the schema of later states or later handles when a page has already filled.
+        List<PreparedHandle> handles = new ArrayList<>();
         for (KeyedStateHandle handle : state.getManagedKeyedState()) {
             checkCancelled();
-            if (sample.full()) {
-                sample.truncated = true;
-                break;
-            }
             try {
-                if (handle instanceof KeyGroupsSavepointStateHandle canonical) {
-                    readCanonical(session, canonical, prefixBytes, sample);
-                } else if (handle instanceof IncrementalRemoteKeyedStateHandle incremental) {
-                    readIncremental(session, incremental, prefixBytes, sample);
-                } else if (handle != null) {
-                    sample.warn("Unsupported keyed-state handle " + handle.getClass().getSimpleName()
+                if (handle instanceof KeyGroupsSavepointStateHandle || handle instanceof IncrementalRemoteKeyedStateHandle) {
+                    handles.add(prepare(session, handle, sample));
+                } else {
+                    sample.incomplete("Unsupported keyed-state handle " + (handle == null ? "null" : handle.getClass().getSimpleName())
                             + "; changelog and non-canonical full snapshots require a dedicated reader.");
                 }
             } catch (InterruptedException cancellation) {
                 throw cancellation;
             } catch (Exception | LinkageError failure) {
                 checkCancelled();
-                sample.warn("Could not sample " + (handle == null ? "null handle" : handle.getClass().getSimpleName())
+                sample.incomplete("Could not read schema for " + (handle == null ? "null handle" : handle.getClass().getSimpleName())
+                        + ": " + failure.getClass().getSimpleName() + ": " + safeMessage(failure));
+            }
+        }
+        for (PreparedHandle handle : handles) {
+            checkCancelled();
+            if (sample.hasMore) break;
+            try {
+                if (handle.handle() instanceof KeyGroupsSavepointStateHandle canonical) {
+                    readCanonical(session, canonical, handle, prefixBytes, sample);
+                } else if (handle.handle() instanceof IncrementalRemoteKeyedStateHandle incremental) {
+                    readIncremental(session, incremental, handle, prefixBytes, sample);
+                }
+            } catch (InterruptedException cancellation) {
+                throw cancellation;
+            } catch (Exception | LinkageError failure) {
+                checkCancelled();
+                sample.incomplete("Could not read " + handle.handle().getClass().getSimpleName()
                         + ": " + failure.getClass().getSimpleName() + ": " + safeMessage(failure));
             }
         }
         checkCancelled();
         if (state.getManagedKeyedState().isEmpty()) sample.warn("This subtask has no managed keyed state.");
-        if (sample.truncated) sample.warn("This is a bounded sample, not a complete entry count.");
+        if (sample.hasMore) sample.warn("More matching records are available; load the next page to continue.");
         if (sample.entries.stream().anyMatch(entry -> entry.ttlTimestamp() != null)) {
             sample.warn("TTL timestamps are stored last-access times, not expiration times. Entries are not filtered: retention and visibility policy are not available from the serializer snapshot.");
         }
         return sample.report();
     }
 
-    private void readCanonical(SnapshotSession session, KeyGroupsSavepointStateHandle handle,
-                               int prefixBytes, Sample sample) throws Exception {
-        // See Flink 1.20 FullSnapshotRestoreOperation: metadata + offset-addressed key groups.
-        // Use local files explicitly instead of handle.openInputStream(), which may access a remote FS.
-        try (FSDataInputStream input = session.files().open(handle.getDelegateStateHandle())) {
+    private record PreparedHandle(KeyedStateHandle handle, KeyedBackendSerializationProxy<?> proxy,
+                                  List<PreviewDecoder.Schema> schemas) {}
+
+    private PreparedHandle prepare(SnapshotSession session, KeyedStateHandle handle, Sample sample) throws Exception {
+        try (FSDataInputStream input = session.files().open(handle instanceof KeyGroupsSavepointStateHandle canonical
+                ? canonical.getDelegateStateHandle() : ((IncrementalRemoteKeyedStateHandle) handle).getMetaDataStateHandle())) {
             KeyedBackendSerializationProxy<?> proxy = readMetadata(input, session.classLoader());
             List<PreviewDecoder.Schema> schemas = PreviewDecoder.schemas(proxy);
             sample.schemas(schemas);
+            return new PreparedHandle(handle, proxy, schemas);
+        } catch (IOException | RuntimeException | LinkageError unavailableMetadata) {
+            if (!(handle instanceof IncrementalRemoteKeyedStateHandle)) throw unavailableMetadata;
+            sample.incomplete("RocksDB state schema unavailable: " + safeMessage(unavailableMetadata) + "; values remain raw.");
+            return new PreparedHandle(handle, null, List.of());
+        }
+    }
+
+    private void readCanonical(SnapshotSession session, KeyGroupsSavepointStateHandle handle,
+                               PreparedHandle prepared, int prefixBytes, Sample sample) throws Exception {
+        // See Flink 1.20 FullSnapshotRestoreOperation: metadata + offset-addressed key groups.
+        // Use local files explicitly instead of handle.openInputStream(), which may access a remote FS.
+        try (FSDataInputStream input = session.files().open(handle.getDelegateStateHandle())) {
+            KeyedBackendSerializationProxy<?> proxy = prepared.proxy();
+            List<PreviewDecoder.Schema> schemas = prepared.schemas();
             for (Tuple2<Integer, Long> group : handle.getGroupRangeOffsets()) {
                 checkCancelled();
                 if (group.f1 == 0L) continue;
@@ -127,18 +161,18 @@ public final class DataPreviewService {
                     int stateId = data.readUnsignedShort();
                     while (stateId != END_OF_KEY_GROUP_MARK) {
                         checkCancelled();
-                        if (sample.full()) {
-                            sample.truncated = true;
-                            return;
-                        }
                         if (stateId >= schemas.size()) throw new IOException("Unknown canonical state ID " + stateId);
-                        PreviewDecoder.RawBytes key = readBytes(data);
-                        PreviewDecoder.RawBytes value = readBytes(data);
+                        PreviewDecoder.Schema schema = schemas.get(stateId);
+                        boolean selected = sample.selects(schema.report().name(), schema);
+                        PreviewDecoder.RawBytes key = readBytes(data, selected ? PreviewDecoder.MAX_RECORD_BYTES : 1);
+                        PreviewDecoder.RawBytes value = readBytes(data, selected ? PreviewDecoder.MAX_RECORD_BYTES : 0);
                         if (key.bytes().length == 0) throw new IOException("Empty canonical key");
                         boolean following = hasMetaDataFollowsFlag(key.bytes());
                         if (following) clearMetaDataFollowsFlag(key.bytes());
-                        PreviewDecoder.Schema schema = schemas.get(stateId);
-                        sample.entries.add(PreviewDecoder.entry(schema.report().name(), schema, key, value, group.f0, prefixBytes));
+                        if (selected) {
+                            sample.accept(PreviewDecoder.entry(schema.report().name(), schema, key, value, group.f0, prefixBytes));
+                            if (sample.hasMore) return;
+                        }
                         if (following) stateId = data.readUnsignedShort();
                     }
                 }
@@ -146,10 +180,10 @@ public final class DataPreviewService {
         }
     }
 
-    private static PreviewDecoder.RawBytes readBytes(DataInputViewStreamWrapper input) throws Exception {
+    private static PreviewDecoder.RawBytes readBytes(DataInputViewStreamWrapper input, int maximumRetained) throws Exception {
         int length = input.readInt();
         if (length < 0) throw new IOException("Negative byte-array length");
-        int retained = Math.min(length, PreviewDecoder.MAX_RECORD_BYTES);
+        int retained = Math.min(length, maximumRetained);
         byte[] bytes = new byte[retained];
         input.readFully(bytes);
         int remaining = length - retained;
@@ -163,15 +197,9 @@ public final class DataPreviewService {
     }
 
     private void readIncremental(SnapshotSession session, IncrementalRemoteKeyedStateHandle handle,
-                                 int prefixBytes, Sample sample) throws Exception {
+                                 PreparedHandle prepared, int prefixBytes, Sample sample) throws Exception {
         Map<String, PreviewDecoder.Schema> schemas = new LinkedHashMap<>();
-        try (FSDataInputStream metadataInput = session.files().open(handle.getMetaDataStateHandle())) {
-            List<PreviewDecoder.Schema> metadataSchemas = PreviewDecoder.schemas(readMetadata(metadataInput, session.classLoader()));
-            sample.schemas(metadataSchemas);
-            for (PreviewDecoder.Schema schema : metadataSchemas) schemas.put(schema.report().name(), schema);
-        } catch (IOException | RuntimeException unavailableMetadata) {
-            sample.warn("RocksDB state schema unavailable: " + safeMessage(unavailableMetadata) + "; values remain raw.");
-        }
+        for (PreviewDecoder.Schema schema : prepared.schemas()) schemas.put(schema.report().name(), schema);
         Path temporary = Files.createTempDirectory("flink-state-preview-");
         try {
             List<HandleAndLocalPath> files = new ArrayList<>(handle.getSharedState());
@@ -203,32 +231,34 @@ public final class DataPreviewService {
                         ByteBuffer buffer = ByteBuffer.allocateDirect(PreviewDecoder.MAX_RECORD_BYTES);
                         byte[] firstGroupPrefix = new byte[prefixBytes];
                         serializeKeyGroup(handle.getKeyGroupRange().getStartKeyGroup(), firstGroupPrefix);
+                        for (byte[] family : families) {
+                            String name = new String(family, StandardCharsets.UTF_8);
+                            if (!schemas.containsKey(name) && !Arrays.equals(family, RocksDB.DEFAULT_COLUMN_FAMILY)) {
+                                sample.schema(new PreviewReport.StateSchema(name, "UNKNOWN", "unknown", "unknown", "unknown"));
+                            }
+                        }
                         for (int index = 0; index < familyHandles.size(); index++) {
                             checkCancelled();
                             String name = new String(families.get(index), StandardCharsets.UTF_8);
                             PreviewDecoder.Schema schema = schemas.get(name);
-                            if (schema == null && !Arrays.equals(families.get(index), RocksDB.DEFAULT_COLUMN_FAMILY)) {
-                                sample.schema(new PreviewReport.StateSchema(name, "UNKNOWN", "unknown", "unknown", "unknown"));
-                            }
+                            boolean defaultFamily = Arrays.equals(families.get(index), RocksDB.DEFAULT_COLUMN_FAMILY);
+                            if (!sample.selects(name, schema)) continue;
                             try (RocksIterator iterator = db.newIterator(familyHandles.get(index), reads)) {
-                                if (schema == null) iterator.seekToFirst();
+                                if (defaultFamily) iterator.seekToFirst();
                                 else iterator.seek(firstGroupPrefix);
                                 while (iterator.isValid()) {
                                     checkCancelled();
                                     PreviewDecoder.RawBytes key = iteratorBytes(iterator, buffer, true);
-                                    if (schema != null) {
+                                    if (!defaultFamily) {
                                         int group = readKeyGroup(prefixBytes, new DataInputDeserializer(key.bytes()));
                                         // A handle's intersection may cover fewer groups than its SST files.
                                         if (group > handle.getKeyGroupRange().getEndKeyGroup()) break;
                                         if (!handle.getKeyGroupRange().contains(group)) throw new IOException("RocksDB key-group outside handle range");
                                     }
-                                    if (sample.full()) {
-                                        sample.truncated = true;
-                                        return;
-                                    }
                                     if (schema == null) sample.schema(new PreviewReport.StateSchema(name, "UNKNOWN", "unknown", "unknown", "unknown"));
                                     PreviewDecoder.RawBytes value = iteratorBytes(iterator, buffer, false);
-                                    sample.entries.add(PreviewDecoder.entry(name, schema, key, value, -1, prefixBytes));
+                                    sample.accept(PreviewDecoder.entry(name, schema, key, value, -1, prefixBytes));
+                                    if (sample.hasMore) return;
                                     iterator.next();
                                 }
                                 iterator.status();
@@ -303,19 +333,93 @@ public final class DataPreviewService {
     }
 
     private static final class Sample {
-        final int limit;
+        final PreviewRequest request;
         final Map<PreviewReport.StateSchema, PreviewReport.StateSchema> schemas = new LinkedHashMap<>();
         final List<PreviewReport.StateEntry> entries = new ArrayList<>();
         final List<String> warnings = new ArrayList<>();
-        boolean truncated;
+        long matched;
+        long scanned;
+        long retainedBytes;
+        boolean hasMore;
+        boolean complete = true;
 
-        Sample(int limit) { this.limit = limit; }
-        boolean full() { return entries.size() >= limit; }
+        Sample(PreviewRequest request) { this.request = request; }
+
+        boolean selects(String stateName, PreviewDecoder.Schema schema) {
+            if (request.stateName() != null && !request.stateName().equals(stateName)) return false;
+            // A condition on a map key or timer timestamp cannot match another known layout.
+            // Unknown layouts must be examined so an unevaluable condition is reported.
+            if (schema != null) {
+                if (request.mapKeyContains() != null && !"MAP".equals(schema.report().type())) return false;
+                if ((request.timerFrom() != null || request.timerTo() != null)
+                        && schema.metadata().getBackendStateType()
+                        != org.apache.flink.runtime.state.metainfo.StateMetaInfoSnapshot.BackendStateType.PRIORITY_QUEUE) return false;
+                if (request.valueContains() != null && schema.metadata().getBackendStateType()
+                        == org.apache.flink.runtime.state.metainfo.StateMetaInfoSnapshot.BackendStateType.PRIORITY_QUEUE) return false;
+            }
+            return true;
+        }
+
+        void accept(PreviewReport.StateEntry entry) {
+            scanned++;
+            if (entry.decodeStatus() == null || !entry.decodeStatus().startsWith("DECODED:")) {
+                incomplete("State " + entry.stateName() + " contains records that are not fully decoded; raw or prefix data does not establish complete decoded results.");
+            }
+            // Check unknown filter fields before testing any known nonmatching field. Otherwise
+            // an AND condition could silently conceal rows whose filters cannot all be evaluated.
+            boolean evaluable = filterAvailable(entry.stateName(), "key", request.keyContains(), entry.key())
+                    & filterAvailable(entry.stateName(), "value", request.valueContains(), entry.value())
+                    & filterAvailable(entry.stateName(), "map key", request.mapKeyContains(), entry.mapKey());
+            if ((request.timerFrom() != null || request.timerTo() != null) && entry.timerTimestamp() == null) {
+                incomplete("Timer timestamp filter could not be evaluated for state " + entry.stateName() + "; undecoded rows were excluded.");
+                evaluable = false;
+            }
+            if (!evaluable || !contains(entry.key(), request.keyContains())
+                    || !contains(entry.value(), request.valueContains())
+                    || !contains(entry.mapKey(), request.mapKeyContains())) return;
+            if (request.timerFrom() != null && entry.timerTimestamp() < request.timerFrom()) return;
+            if (request.timerTo() != null && entry.timerTimestamp() > request.timerTo()) return;
+            matched++;
+            if (matched <= request.offset()) return;
+            long size = retainedSize(entry);
+            if (entries.size() >= request.limit()) hasMore = true;
+            else if (!entries.isEmpty() && retainedBytes + size > MAX_PAGE_BYTES) {
+                // A page is bounded by both rows and retained decoded text. Always allow its
+                // first record so a valid large record can never make pagination stall.
+                hasMore = true;
+                warn("Page memory budget reached; fewer rows were returned. Load the next page to continue.");
+            } else {
+                entries.add(entry);
+                retainedBytes += size;
+            }
+        }
+
+        private static long retainedSize(PreviewReport.StateEntry entry) {
+            long chars = length(entry.stateName()) + length(entry.key()) + length(entry.namespace())
+                    + length(entry.value()) + length(entry.mapKey()) + length(entry.keyHex())
+                    + length(entry.valueHex()) + length(entry.decodeStatus()) + length(entry.timerType());
+            return 256 + chars * 2;
+        }
+
+        private static long length(String value) { return value == null ? 0 : value.length(); }
+
+        private boolean filterAvailable(String stateName, String field, String condition, String decoded) {
+            if (condition == null || decoded != null) return true;
+            incomplete("The " + field + " filter could not be evaluated for state " + stateName + "; undecoded rows were excluded.");
+            return false;
+        }
+
+        private static boolean contains(String decoded, String condition) {
+            return condition == null || decoded != null && decoded.contains(condition);
+        }
+
         void schema(PreviewReport.StateSchema schema) { schemas.putIfAbsent(schema, schema); }
         void schemas(List<PreviewDecoder.Schema> values) { for (PreviewDecoder.Schema value : values) schema(value.report()); }
         void warn(String warning) { if (!warnings.contains(warning)) warnings.add(warning); }
+        void incomplete(String warning) { complete = false; warn(warning); }
         PreviewReport report() {
-            return new PreviewReport(List.copyOf(schemas.values()), List.copyOf(entries), truncated, List.copyOf(warnings));
+            return new PreviewReport(List.copyOf(schemas.values()), List.copyOf(entries), hasMore, List.copyOf(warnings),
+                    new PreviewReport.PageInfo(request.offset(), request.offset() + entries.size(), scanned, hasMore, complete));
         }
     }
 }

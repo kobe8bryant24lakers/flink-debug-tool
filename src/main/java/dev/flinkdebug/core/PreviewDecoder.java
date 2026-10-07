@@ -37,6 +37,9 @@ final class PreviewDecoder {
     private static final String POJO = "org.apache.flink.api.java.typeutils.runtime.PojoSerializer";
     private static final String TTL = "org.apache.flink.runtime.state.ttl.TtlStateFactory$TtlSerializer";
     private static final String TTL_AWARE = "org.apache.flink.runtime.state.ttl.TtlAwareSerializer";
+    private static final String TIMER = "org.apache.flink.streaming.api.operators.TimerSerializer";
+    private static final String TIME_WINDOW = "org.apache.flink.streaming.api.windowing.windows.TimeWindow$Serializer";
+    private static final String GLOBAL_WINDOW = "org.apache.flink.streaming.api.windowing.windows.GlobalWindow$Serializer";
     private static final ObjectMapper JSON = new ObjectMapper();
 
     record RawBytes(byte[] bytes, int length) {
@@ -61,11 +64,22 @@ final class PreviewDecoder {
             TypeSerializerSnapshot<?> valueSnapshot = state.getTypeSerializerSnapshot(VALUE_SERIALIZER);
             TypeSerializer<?> namespace = restoreKnown(namespaceSnapshot);
             TypeSerializer<?> value = restoreKnown(valueSnapshot);
+            TypeSerializer<?> reportedKey = key;
+            if (state.getBackendStateType() == StateMetaInfoSnapshot.BackendStateType.PRIORITY_QUEUE
+                    && value != null && value.getClass().getName().equals(TIMER)) {
+                try {
+                    // Queue metadata stores both serializers inside the timer element serializer.
+                    reportedKey = (TypeSerializer<?>) serializerMember(value, "getKeySerializer");
+                    namespace = (TypeSerializer<?>) serializerMember(value, "getNamespaceSerializer");
+                } catch (ReflectiveOperationException unavailable) {
+                    value = null;
+                }
+            }
             String type = state.getOption(KEYED_STATE_TYPE);
             if (type == null) type = state.getBackendStateType().name();
-            result.add(new Schema(state, key, namespace, value,
+            result.add(new Schema(state, reportedKey, namespace, value,
                     new PreviewReport.StateSchema(state.getName(), type,
-                            serializerLabel(keySnapshot, key), serializerLabel(namespaceSnapshot, namespace),
+                            serializerLabel(keySnapshot, reportedKey), serializerLabel(namespaceSnapshot, namespace),
                             serializerLabel(valueSnapshot, value))));
         }
         return result;
@@ -96,10 +110,13 @@ final class PreviewDecoder {
         try {
             String name = snapshot.getClass().getName();
             if (name.equals(VOID_NAMESPACE + "$VoidNamespaceSerializerSnapshot")) return true;
+            if (name.equals(TIME_WINDOW + "$TimeWindowSerializerSnapshot")
+                    || name.equals(GLOBAL_WINDOW + "$GlobalWindowSerializerSnapshot")) return true;
             for (String scalar : SCALAR_NAMES) {
                 if (name.equals(BASE + scalar + "Serializer$" + scalar + "SerializerSnapshot")) return true;
             }
-            if (name.equals(BASE + "MapSerializerSnapshot") || name.equals(TTL + "Snapshot")) {
+            if (name.equals(BASE + "MapSerializerSnapshot") || name.equals(TTL + "Snapshot")
+                    || name.equals(TIMER + "Snapshot")) {
                 if (!(snapshot instanceof org.apache.flink.api.common.typeutils.CompositeTypeSerializerSnapshot<?, ?> composite)) return false;
                 TypeSerializerSnapshot<?>[] nested = composite.getNestedSerializerSnapshots();
                 if (nested == null || nested.length != 2) return false;
@@ -150,9 +167,12 @@ final class PreviewDecoder {
         String mapKeyText = null;
         String valueText = null;
         Long ttlTimestamp = null;
+        Long timerTimestamp = null;
+        String timerType = null;
         int keyGroup = expectedKeyGroup;
         String status;
         try {
+            if (keyGroupPrefixBytes < 1 || keyGroupPrefixBytes > 2) throw new IOException("invalid key-group prefix length");
             if (key.bytes.length < keyGroupPrefixBytes) throw new IOException("key-group prefix missing");
             DataInputDeserializer keyView = new DataInputDeserializer(key.bytes);
             int encodedKeyGroup = CompositeKeySerializationUtils.readKeyGroup(keyGroupPrefixBytes, keyView);
@@ -162,12 +182,30 @@ final class PreviewDecoder {
             keyGroup = encodedKeyGroup;
             if (schema == null) {
                 status = "RAW: state schema unavailable";
+            } else if (!key.complete() || !value.complete()) {
+                status = "RAW: record exceeds " + MAX_RECORD_BYTES + " byte decoding limit";
+            } else if (schema.metadata.getBackendStateType() == StateMetaInfoSnapshot.BackendStateType.PRIORITY_QUEUE) {
+                if (schema.valueSerializer == null || !schema.valueSerializer.getClass().getName().equals(TIMER)) {
+                    status = "RAW: priority queue serializer requires an explicit reader";
+                } else {
+                    // RocksDB queues and canonical queue iterators write key-group + TimerSerializer
+                    // bytes as the key, and no value. TimerSerializer flips the timestamp sign bit
+                    // for lexicographic ordering; its key/namespace have no composite-key markers.
+                    if (value.length != 0) throw new IOException("non-empty timer value");
+                    long timestamp = keyView.readLong() ^ Long.MIN_VALUE;
+                    Object decodedKey = readKnown(schema.keySerializer, keyView, key.bytes, 0);
+                    Object decodedNamespace = readKnown(schema.namespaceSerializer, keyView, key.bytes, 0);
+                    requireConsumed(keyView, "timer");
+                    keyText = render(decodedKey);
+                    namespaceText = render(decodedNamespace);
+                    timerTimestamp = timestamp;
+                    timerType = timerType(stateName);
+                    status = "DECODED: Flink timer snapshot serializers";
+                }
             } else if (schema.metadata.getBackendStateType() != StateMetaInfoSnapshot.BackendStateType.KEY_VALUE) {
                 status = "RAW: " + schema.metadata.getBackendStateType() + " layout";
             } else if (!Set.of("VALUE", "REDUCING", "AGGREGATING", "MAP").contains(schema.report.type())) {
                 status = "RAW: " + schema.report.type() + " layout requires an explicit reader";
-            } else if (!key.complete() || !value.complete()) {
-                status = "RAW: record exceeds " + MAX_RECORD_BYTES + " byte decoding limit";
             } else {
                 boolean isMap = "MAP".equals(schema.report.type());
                 TypeSerializer<?> stateSerializer = unwrap(schema.valueSerializer);
@@ -217,7 +255,13 @@ final class PreviewDecoder {
                     + bounded(decodingFailure.getMessage() == null ? "invalid serialized record" : decodingFailure.getMessage());
         }
         return new PreviewReport.StateEntry(stateName, keyGroup, keyText, namespaceText, valueText,
-                hex(key), hex(value), status, mapKeyText, ttlTimestamp);
+                hex(key), hex(value), status, mapKeyText, ttlTimestamp, timerTimestamp, timerType);
+    }
+
+    private static String timerType(String name) {
+        if (name.startsWith("_timer_state/event_")) return "EVENT_TIME";
+        if (name.startsWith("_timer_state/processing_")) return "PROCESSING_TIME";
+        return null;
     }
 
     private static void requireConsumed(DataInputDeserializer input, String field) throws IOException {
@@ -254,6 +298,16 @@ final class PreviewDecoder {
             return serializer.deserialize(input);
         }
         String name = serializer.getClass().getName();
+        if (name.equals(TIME_WINDOW)) {
+            Map<String, Object> window = new LinkedHashMap<>();
+            window.put("start", input.readLong());
+            window.put("end", input.readLong());
+            return window;
+        }
+        if (name.equals(GLOBAL_WINDOW)) {
+            if (input.readUnsignedByte() != 0) throw new IOException("invalid global-window marker");
+            return "GlobalWindow";
+        }
         if (name.equals(TTL)) {
             TypeSerializer<?> timestamp = (TypeSerializer<?>) serializerMember(serializer, "getTimestampSerializer");
             if (!timestamp.getClass().getName().equals(BASE + "LongSerializer")) {
@@ -329,7 +383,9 @@ final class PreviewDecoder {
     }
 
     private static String render(Object object) throws IOException {
-        return bounded(object instanceof Map ? JSON.writeValueAsString(object) : object == null ? "null" : String.valueOf(object));
+        // Preserve complete decoded fields so filters also match beyond the first 4,096 characters.
+        // Input records remain subject to MAX_RECORD_BYTES; only diagnostics and raw hex are bounded.
+        return object instanceof Map ? JSON.writeValueAsString(object) : object == null ? "null" : String.valueOf(object);
     }
 
     private static String bounded(String value) {
