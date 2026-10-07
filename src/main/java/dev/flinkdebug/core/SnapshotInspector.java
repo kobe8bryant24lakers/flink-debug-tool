@@ -138,7 +138,8 @@ public final class SnapshotInspector {
             }
             operators.add(new SnapshotReport.OperatorReport(operatorId, operator.getParallelism(),
                     operator.getMaxParallelism(), operator.getStateSize(),
-                    operator.getCheckpointedSize(), operator.isFullyFinished(), List.copyOf(subtasks)));
+                    operator.getCheckpointedSize(), operator.isFullyFinished(), List.copyOf(subtasks),
+                    operatorText(operator, "getOperatorName"), operatorText(operator, "getOperatorUid")));
             referencedBytes += operator.getStateSize();
             checkpointedBytes += operator.getCheckpointedSize();
         }
@@ -162,10 +163,21 @@ public final class SnapshotInspector {
         diagnostics.add(new SnapshotReport.Diagnostic("INFO",
                 "状态大小来自 metadata 中的 handle 引用，可能重复引用共享文件；不是业务记录数或去重磁盘占用。"));
         diagnostics.add(new SnapshotReport.Diagnostic("INFO",
-                "metadata 格式版本不代表生成快照的 Flink 版本；Flink 1.20 metadata 不包含原始 UID、算子名称和 checkpoint 耗时。"));
+                "metadata 格式版本不代表生成快照的 Flink 版本；页面显示的是解析器运行时版本。"));
         return new SnapshotReport(metadataPath, EnvironmentInformation.getVersion(), formatVersion,
                 metadata.getCheckpointId(), kind, referencedBytes, checkpointedBytes,
                 List.copyOf(operators), List.copyOf(stateFiles), List.copyOf(diagnostics));
+    }
+
+    /** Newer metadata carries labels; Flink 1.20 has no such API or saved fields. */
+    static String operatorText(OperatorState operator, String getter) {
+        try {
+            Object value = operator.getClass().getMethod(getter).invoke(operator);
+            if (value instanceof java.util.Optional<?> optional) value = optional.orElse(null);
+            return value instanceof String text && !text.isBlank() ? text : null;
+        } catch (ReflectiveOperationException | RuntimeException | LinkageError unavailable) {
+            return null;
+        }
     }
 
     private void addKeyed(String operator, int subtask, String category, KeyedStateHandle handle,
