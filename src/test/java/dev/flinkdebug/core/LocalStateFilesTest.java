@@ -11,12 +11,14 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.net.URI;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 class LocalStateFilesTest {
     @TempDir Path directory;
@@ -37,18 +39,31 @@ class LocalStateFilesTest {
         assertThrows(IOException.class, () -> files.open(file("s3://bucket/unmapped.sst", 1)));
     }
 
-    @Test void rejectsRelativeTraversalAndMappedSymlinkEscape() throws Exception {
+    @Test void rejectsRelativeTraversal() throws Exception {
         Path root = Files.createDirectory(directory.resolve("snapshot"));
         Path outside = Files.createDirectory(directory.resolve("outside"));
         Files.write(outside.resolve("secret.sst"), new byte[]{9});
-        Files.createSymbolicLink(root.resolve("escape"), outside);
-        var files = new LocalStateFiles(root, List.of(new PathMapping("s3://bucket/job", root)));
+        var files = new LocalStateFiles(root, List.of());
         var relative = new RelativeFileStateHandle(new org.apache.flink.core.fs.Path(
                 root.resolve("state").toUri()), "../outside/secret.sst", 1);
         assertEquals("REJECTED", files.resolve(relative).availability());
+        assertThrows(IOException.class, () -> files.open(relative));
+    }
+
+    @Test void rejectsMappedSymlinkEscape() throws Exception {
+        Path root = Files.createDirectory(directory.resolve("snapshot"));
+        Path outside = Files.createDirectory(directory.resolve("outside"));
+        Files.write(outside.resolve("secret.sst"), new byte[]{9});
+        try {
+            Files.createSymbolicLink(root.resolve("escape"), outside);
+        } catch (FileSystemException cannotCreateLink) {
+            assumeFalse(org.junit.jupiter.api.condition.OS.WINDOWS.isCurrentOs(),
+                    "This Windows account could not create the test symlink: " + cannotCreateLink.getReason());
+            throw cannotCreateLink;
+        }
+        var files = new LocalStateFiles(root, List.of(new PathMapping("s3://bucket/job", root)));
         assertEquals("REJECTED", files.resolve(file("s3://bucket/job/escape/secret.sst", 1))
                 .availability());
-        assertThrows(IOException.class, () -> files.open(relative));
     }
 
     @Test void encodedTraversalCannotEscapeAMapping() {

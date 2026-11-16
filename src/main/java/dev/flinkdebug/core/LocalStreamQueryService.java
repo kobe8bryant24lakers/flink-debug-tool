@@ -80,7 +80,8 @@ public final class LocalStreamQueryService {
             env.setRuntimeMode(RuntimeExecutionMode.BATCH);
             env.setParallelism(1);
             env.getConfig().disableClosureCleaner();
-            var reader = SavepointReader.read(env, copy.directory().toUri().toString(), new EmbeddedRocksDBStateBackend());
+            String localPointer = new org.apache.flink.core.fs.Path(copy.directory().toUri()).toString();
+            var reader = SavepointReader.read(env, localPointer, new EmbeddedRocksDBStateBackend());
             var stream = reader.readKeyedState(OperatorIdentifier.forUidHash(spec.operatorId()), new PrimitiveReader(spec),
                     type(spec.keyType()), Types.TUPLE(Types.STRING, Types.STRING));
             var rows = new ArrayList<QueryRow>();

@@ -20,7 +20,7 @@ class LocalStreamQueryTest {
     @TempDir Path temporary;
 
     @Test void queriesRealRocksDbGeneratedSavepointWithoutChangingSource() throws Exception {
-        Path snapshot = temporary.resolve("savepoint");
+        Path snapshot = temporary.resolve("savepoint 测试 with spaces %20");
         ExampleSnapshot.create(snapshot);
         Map<String, String> original = hashes(snapshot);
         try (var session = new SnapshotInspector().open(snapshot, List.of(), List.of())) {

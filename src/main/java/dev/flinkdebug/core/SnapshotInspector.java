@@ -62,7 +62,7 @@ public final class SnapshotInspector {
                 }
                 stream.reset();
                 metadata = Checkpoints.loadCheckpointMetadata(
-                        stream, loader, metadataPath.getParent().toUri().toString());
+                        stream, loader, new org.apache.flink.core.fs.Path(metadataPath.getParent().toUri()).toString());
                 if (stream.read() != -1) {
                     throw new IOException("Flink metadata 包含未识别的尾部数据");
                 }
