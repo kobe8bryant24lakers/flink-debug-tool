@@ -35,12 +35,17 @@ jobs:
     name: Resolve version
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    permissions: {}
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       number: ${{ steps.resolve.outputs.number }}
       release: ${{ steps.resolve.outputs.release }}
+      build: ${{ steps.resolve.outputs.build }}
     steps:
+      - name: Check out release candidate source
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Validate version and release mode
         id: resolve
         shell: bash
@@ -48,11 +53,20 @@ jobs:
           EVENT: ${{ github.event_name }}
           MANUAL_TAG: ${{ inputs.tag }}
           PUBLISH: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           mode=none
+          build=true
           case "$EVENT" in
-            pull_request) tag=v0.0.0 ;;
-            push) tag="$GITHUB_REF_NAME"; mode=draft ;;
+            pull_request)
+              candidate="$(python3 -c 'import xml.etree.ElementTree as et; print(et.parse("pom.xml").getroot().findtext("{*}version").removesuffix("-SNAPSHOT"))')"
+              tag="v$candidate"
+              ;;
+            push)
+              tag="$GITHUB_REF_NAME"
+              mode=draft
+              ;;
             workflow_dispatch)
               tag="$MANUAL_TAG"
               if [[ "$PUBLISH" == true ]]; then mode=publish; fi
@@ -62,15 +76,22 @@ jobs:
             echo "::error::Use a version tag in vX.Y.Z format."
             exit 1
           fi
+          if [[ "$mode" == draft ]] && [[ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null || true)" == false ]]; then
+            echo "Release $tag was already published from verified assets."
+            mode=none
+            build=false
+          fi
           {
             echo "tag=$tag"
             echo "number=${tag#v}"
             echo "release=$mode"
+            echo "build=$build"
           } >> "$GITHUB_OUTPUT"
 
   package:
     name: Package ${{ matrix.platform }}
     needs: version
+    if: needs.version.outputs.build == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
