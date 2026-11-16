@@ -43,6 +43,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -138,12 +139,19 @@ class DataPreviewPagingTest {
         Path download = incremental(List.of(valueSchema("bulk"), valueSchema("later")), concat(
                 scalarRows("bulk", 1205), List.of(scalar("later", "late-key", string("late-value")))));
         Map<String, String> before = fingerprints(download);
+        Path cachePath;
         try (SnapshotSession session = open(download)) {
             PreviewReport first = preview(session, page(1000, 0));
+            cachePath = session.previewRocksCache().directory();
+            assertNotNull(cachePath);
+            assertTrue(Files.isDirectory(cachePath));
             PreviewReport last = preview(session, page(1000, first.page().nextOffset()));
+            assertEquals(cachePath, session.previewRocksCache().directory());
             assertTrue(first.page().hasMore());
             assertEquals(2, first.schemas().size());
             assertEquals(206, last.entries().size());
+            assertEquals(1001, first.page().scanned());
+            assertEquals(206, last.page().scanned());
             assertTrue(last.entries().stream().anyMatch(row -> "late-value".equals(row.value())));
             assertFalse(last.page().hasMore());
             assertTrue(last.page().complete(), () -> String.join("\n", last.warnings()));
@@ -152,6 +160,7 @@ class DataPreviewPagingTest {
             last.entries().forEach(row -> assertTrue(keys.add(row.key())));
             assertEquals(1206, keys.size());
         }
+        assertFalse(Files.exists(cachePath), "Closing the snapshot must remove its private copy");
         assertEquals(before, fingerprints(download));
     }
 
@@ -173,7 +182,7 @@ class DataPreviewPagingTest {
             assertEquals(new HashSet<>(List.of("approved-one", "approved-two")),
                     new HashSet<>(List.of(first.entries().get(0).value(), last.entries().get(0).value())));
             assertEquals(2, last.page().nextOffset());
-            assertEquals(4, last.page().scanned());
+            assertTrue(last.page().scanned() < 4, "Resume must not scan rows preceding the lookahead match");
             assertEquals(2, first.schemas().size());
             PreviewReport noMatch = preview(session, request(20, 0, null, null, null, "absent", null, null));
             assertTrue(noMatch.entries().isEmpty());
@@ -196,12 +205,107 @@ class DataPreviewPagingTest {
             assertEquals(List.of(1L), last.entries().stream().map(PreviewReport.StateEntry::timerTimestamp).toList());
             assertFalse(last.page().hasMore());
             assertTrue(last.page().complete(), () -> String.join("\n", last.warnings()));
-            assertEquals(4, last.page().scanned());
+            assertEquals(2, last.page().scanned());
             assertTrue(last.entries().stream().allMatch(row -> timerState.equals(row.stateName())));
             PreviewReport businessValues = preview(session, request(10, 0, null, null, "ordinary", null, null, null));
             assertEquals(List.of("ordinary-value"), businessValues.entries().stream().map(PreviewReport.StateEntry::value).toList());
             assertTrue(businessValues.page().complete()); // Timers have no business value and legitimately do not match.
         }
+    }
+
+    @Test void nativeResumeKeepsPrefixCoverageGapsWhenTheRemainingRowsDecode() throws Exception {
+        Row first = map("lookup", "account", "a", "ignored");
+        Row corrupt = new Row(first.state(), first.group(), first.key(), new byte[]{0, (byte) 0xff});
+        Path download = incremental(List.of(mapSchema("lookup")), List.of(corrupt,
+                map("lookup", "account", "b", "next"), map("lookup", "account", "c", "last")));
+        try (SnapshotSession session = open(download)) {
+            PreviewReport page1 = preview(session, page(1, 0));
+            assertFalse(page1.page().complete());
+            assertTrue(page1.page().hasMore());
+            PreviewReport page2 = preview(session, page(1, page1.page().nextOffset()));
+            assertEquals("next", page2.entries().get(0).value());
+            assertEquals(2, page2.page().scanned());
+            assertFalse(page2.page().complete());
+            PreviewReport page3 = preview(session, page(1, page2.page().nextOffset()));
+            assertEquals("last", page3.entries().get(0).value());
+            assertEquals(1, page3.page().scanned());
+            assertFalse(page3.page().hasMore());
+            assertFalse(page3.page().complete());
+            assertTrue(page3.warnings().stream().anyMatch(warning -> warning.contains("not fully decoded")));
+        }
+    }
+
+    @Test void nativeOffsetsRemainStatelessWhenQueryChangesOrAReaderOpensAFreshSession() throws Exception {
+        Path download = incremental(List.of(valueSchema("orders")), scalarRows("orders", 9));
+        PreviewRequest changedFilter = request(2, 2, "orders", "customer-", "value-", null, null, null);
+        PreviewReport afterChangedFilter;
+        try (SnapshotSession session = open(download)) {
+            PreviewReport first = preview(session, page(2, 0));
+            assertEquals(2, first.page().nextOffset());
+            Path copy = session.previewRocksCache().directory();
+            afterChangedFilter = preview(session, changedFilter);
+            assertEquals(5, afterChangedFilter.page().scanned());
+            assertEquals(copy, session.previewRocksCache().directory());
+        }
+        try (SnapshotSession fresh = open(download)) {
+            assertEquals(afterChangedFilter, preview(fresh, changedFilter));
+        }
+    }
+
+    @Test void modifiedOrMissingSourceEvictsThePrivateCopyAndRejectsItsOldAnchor() throws Exception {
+        Path download = incremental(List.of(valueSchema("orders")), scalarRows("orders", 9));
+        Path sst;
+        try (var files = Files.list(download.resolve("rocks"))) {
+            sst = files.filter(file -> file.getFileName().toString().endsWith(".sst")).findFirst().orElseThrow();
+        }
+        try (SnapshotSession session = open(download)) {
+            PreviewReport first = preview(session, page(2, 0));
+            Path oldCopy = session.previewRocksCache().directory();
+            Files.setLastModifiedTime(sst, FileTime.fromMillis(Files.getLastModifiedTime(sst).toMillis() + 10_000));
+            PreviewReport changed = preview(session, page(2, first.page().nextOffset()));
+            assertEquals(5, changed.page().scanned());
+            assertFalse(changed.page().complete());
+            assertTrue(changed.warnings().stream().anyMatch(warning -> warning.contains("files changed since the previous page")));
+            assertFalse(Files.exists(oldCopy));
+            Path replacement = session.previewRocksCache().directory();
+            assertNotNull(replacement);
+            assertNotEquals(oldCopy, replacement);
+
+            Files.delete(sst);
+            PreviewReport missing = preview(session, page(2, changed.page().nextOffset()));
+            assertTrue(missing.entries().isEmpty());
+            assertFalse(missing.page().complete());
+            assertTrue(missing.warnings().stream().anyMatch(warning -> warning.contains("MISSING")));
+            assertFalse(Files.exists(replacement));
+            assertNull(session.previewRocksCache().directory());
+        }
+    }
+
+    @Test void nativeMemoryBudgetLookaheadResumesAtTheFirstExcludedRow() throws Exception {
+        String value = "v".repeat(800_000);
+        byte[] bytes = string(value);
+        List<Row> rows = new ArrayList<>();
+        for (int i = 0; i < 24; i++) rows.add(scalar("orders", "large-" + i, bytes));
+        Path download = incremental(List.of(valueSchema("orders")), rows);
+        try (SnapshotSession session = open(download)) {
+            PreviewReport first = preview(session, page(1000, 0));
+            assertTrue(first.page().hasMore());
+            assertTrue(first.warnings().stream().anyMatch(warning -> warning.contains("Page memory budget reached")));
+            assertEquals(first.entries().size() + 1, first.page().scanned());
+            PreviewReport last = preview(session, page(1000, first.page().nextOffset()));
+            assertFalse(last.page().hasMore());
+            assertTrue(last.page().complete());
+            assertEquals(last.entries().size(), last.page().scanned());
+            List<String> keys = concatEntries(first, last).stream().map(PreviewReport.StateEntry::key).toList();
+            assertEquals(24, keys.size());
+            assertEquals(24, new HashSet<>(keys).size());
+        }
+    }
+
+    private static List<PreviewReport.StateEntry> concatEntries(PreviewReport first, PreviewReport last) {
+        List<PreviewReport.StateEntry> entries = new ArrayList<>(first.entries());
+        entries.addAll(last.entries());
+        return entries;
     }
 
     @Test void largeDecodedStringsContinueOnAnotherPageBeforeTheRetainedMemoryBudgetIsExceeded() throws Exception {

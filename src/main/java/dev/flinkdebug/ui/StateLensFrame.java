@@ -16,11 +16,13 @@ import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.DefaultTableModel;
 import javax.swing.tree.DefaultMutableTreeNode;
 import javax.swing.tree.DefaultTreeModel;
 import javax.swing.tree.DefaultTreeCellRenderer;
 import javax.swing.tree.TreePath;
+import javax.swing.tree.TreeSelectionModel;
 import java.awt.*;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -30,8 +32,11 @@ import java.io.BufferedWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.DateTimeException;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Callable;
@@ -67,8 +72,9 @@ public final class StateLensFrame extends JFrame {
     private final JLabel selectionSummary = new JLabel("选择算子或子任务");
     private final DefaultTableModel filesModel = readOnlyModel("算子 ID", "子任务", "类别", "句柄类型", "Key-group", "本地状态", "声明大小", "实际大小", "原始路径", "本地路径");
     private final DefaultTableModel schemasModel = readOnlyModel("状态名", "状态类型", "Key 序列化器", "Namespace 序列化器", "Value 序列化器");
-    private final DefaultTableModel samplesModel = readOnlyModel("状态名", "Key（解码）", "Map key（解码）", "Value（解码）", "Timer 时间（ms）", "Timer 类型", "Namespace（解码）", "TTL 时间戳（ms）", "Key-group", "解码结果", "Key 原始 HEX", "Value 原始 HEX");
-    private final DefaultTableModel diagnosticsModel = readOnlyModel("级别", "诊断说明");
+    private final DefaultTableModel samplesModel = readOnlyModel(Map.of(4, Long.class, 7, Long.class, 8, Integer.class),
+            "状态名", "Key（解码）", "Map key（解码）", "Value（解码）", "Timer 时间（ms）", "Timer 类型", "Namespace（解码）", "TTL 时间戳（ms）", "Key-group", "解码结果", "Key 原始 HEX", "Value 原始 HEX");
+    private final DefaultTableModel diagnosticsModel = readOnlyModel("范围", "级别", "诊断说明");
     private final JTable filesTable = table(filesModel);
     private final JTable schemasTable = table(schemasModel);
     private final JTable samplesTable = table(samplesModel);
@@ -80,10 +86,12 @@ public final class StateLensFrame extends JFrame {
     private final JTextField timerFromFilter = new JTextField();
     private final JTextField timerToFilter = new JTextField();
     private final JButton resetFilters = new JButton("重置筛选");
+    private final JButton applyFilters = new JButton("应用筛选");
     private final JButton useSchemaFilter = new JButton("用于数据筛选");
     private final JButton previousPage = new JButton("上一页");
     private final JButton nextPage = new JButton("下一页");
     private final JLabel pagePosition = new JLabel("尚未加载页面");
+    private final JButton viewDiagnostics = new JButton("查看诊断");
     private final JLabel schemaSummary = new JLabel("请选择具体子任务，然后点击“加载数据”读取状态 Schema。");
     private final JLabel sampleSummary = new JLabel("未读取状态数据。请选择具体子任务，然后点击“加载数据”。");
     private final JTabbedPane details = new JTabbedPane();
@@ -109,6 +117,7 @@ public final class StateLensFrame extends JFrame {
     private SnapshotReport report;
     private PreviewReport preview;
     private PreviewRequest loadedPreviewRequest;
+    private List<String> queryWarnings = List.of();
     private final List<Long> pageHistory = new ArrayList<>();
     private int pageIndex = -1;
     private long filterRevision;
@@ -252,6 +261,7 @@ public final class StateLensFrame extends JFrame {
         help.setForeground(MUTED);
         relocation.add(help, BorderLayout.NORTH);
         mappings.setRowHeight(25);
+        mappings.setDefaultRenderer(Object.class, literalCellRenderer());
         mappings.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
         mappings.setToolTipText("示例：hdfs://cluster/flink/shared/ → 下载目录中的 shared 文件夹。可配置多条；加载前生效。");
         JScrollPane mapScroll = new JScrollPane(mappings);
@@ -303,10 +313,12 @@ public final class StateLensFrame extends JFrame {
         operatorTree.setRootVisible(true);
         operatorTree.setShowsRootHandles(true);
         operatorTree.setRowHeight(28);
+        operatorTree.getSelectionModel().setSelectionMode(TreeSelectionModel.SINGLE_TREE_SELECTION);
         operatorTree.setCellRenderer(new DefaultTreeCellRenderer() {
             @Override public Component getTreeCellRendererComponent(JTree tree, Object value, boolean selected,
                                                                      boolean expanded, boolean leaf, int row,
                                                                      boolean hasFocus) {
+                putClientProperty("html.disable", Boolean.TRUE);
                 Component component = super.getTreeCellRendererComponent(tree, value, selected, expanded, leaf, row, hasFocus);
                 setToolTipText(value instanceof DefaultMutableTreeNode node && node.getUserObject() instanceof TreeItem item
                         ? item.identityTooltip() : null);
@@ -328,9 +340,12 @@ public final class StateLensFrame extends JFrame {
         details.addTab("状态 Schema", schemasPanel());
         details.addTab("状态数据", samplesPanel());
         details.addTab("业务状态查询", queryPanel());
-        diagnosticsTable.getColumnModel().getColumn(0).setPreferredWidth(80);
-        diagnosticsTable.getColumnModel().getColumn(0).setMaxWidth(120);
+        diagnosticsTable.getColumnModel().getColumn(0).setPreferredWidth(145);
+        diagnosticsTable.getColumnModel().getColumn(0).setMaxWidth(170);
+        diagnosticsTable.getColumnModel().getColumn(1).setPreferredWidth(70);
+        diagnosticsTable.getColumnModel().getColumn(1).setMaxWidth(90);
         details.addTab("诊断", new JScrollPane(diagnosticsTable));
+        updateDiagnosticsCount();
 
         JPanel inspector = new JPanel(new BorderLayout());
         inspector.setOpaque(false);
@@ -350,7 +365,7 @@ public final class StateLensFrame extends JFrame {
         JPanel heading = new JPanel(new BorderLayout(8, 0));
         heading.add(schemaSummary, BorderLayout.CENTER);
         heading.add(useSchemaFilter, BorderLayout.EAST);
-        useSchemaFilter.setToolTipText("将选中的 Schema 状态名作为后端筛选条件；随后点击“加载数据”从第一页读取。");
+        useSchemaFilter.setToolTipText("将选中的 Schema 状态名填入筛选条件；随后点击“应用筛选”从第一页读取。");
         panel.add(heading, BorderLayout.NORTH);
         panel.add(new JScrollPane(schemasTable), BorderLayout.CENTER);
         return panel;
@@ -359,40 +374,49 @@ public final class StateLensFrame extends JFrame {
     private JPanel samplesPanel() {
         JPanel panel = new JPanel(new BorderLayout(8, 8));
         panel.setBorder(new EmptyBorder(8, 8, 8, 8));
-        JPanel filters = new JPanel(new GridLayout(2, 1, 0, 5));
+        JPanel filters = new JPanel(new BorderLayout(0, 5));
+        JLabel help = new JLabel("留空不限制 · 条件同时满足 · 文本区分大小写");
+        help.setForeground(MUTED);
+        filters.add(help, BorderLayout.NORTH);
         JPanel textFilters = new JPanel(new GridLayout(1, 4, 8, 0));
         textFilters.add(filterField("状态", stateFilter));
         textFilters.add(filterField("Key 包含", keyFilter));
         textFilters.add(filterField("Value 包含", valueFilter));
         textFilters.add(filterField("Map key 包含", mapKeyFilter));
-        filters.add(textFilters);
-        JPanel timerFilters = new JPanel(new GridLayout(1, 3, 8, 0));
-        timerFilters.add(filterField("Timer 起始 ms", timerFromFilter));
-        timerFilters.add(filterField("Timer 截止 ms", timerToFilter));
-        JPanel filterActions = new JPanel(new BorderLayout(6, 0));
-        JLabel help = new JLabel("条件同时满足 · 区分大小写");
-        help.setForeground(MUTED);
-        filterActions.add(help, BorderLayout.CENTER);
-        filterActions.add(resetFilters, BorderLayout.EAST);
-        timerFilters.add(filterActions);
-        filters.add(timerFilters);
+        filters.add(textFilters, BorderLayout.CENTER);
+        JPanel timerRow = new JPanel(new BorderLayout(8, 0));
+        JPanel timerFilters = new JPanel(new GridLayout(1, 2, 8, 0));
+        timerFilters.add(filterField("Timer 起始", timerFromFilter));
+        timerFilters.add(filterField("Timer 截止", timerToFilter));
+        timerRow.add(timerFilters, BorderLayout.CENTER);
+        JPanel filterActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        filterActions.add(resetFilters);
+        filterActions.add(applyFilters);
+        timerRow.add(filterActions, BorderLayout.EAST);
+        filters.add(timerRow, BorderLayout.SOUTH);
+        applyFilters.setToolTipText("使用当前条件从第一页读取；继续沿用条件请使用“上一页”或“下一页”。");
+        stateFilter.setPrototypeDisplayValue(new StateChoice("0000000000000000"));
         stateFilter.setToolTipText("全部状态或当前子任务实际读取到的状态名；修改条件后点击“加载数据”从第一页读取。");
         String textHelp = "在后台筛选完整解码字段，区分大小写；留空表示不限制。条件无法解码时，诊断会说明读取不完整。";
         keyFilter.setToolTipText(textHelp);
         valueFilter.setToolTipText(textHelp + " Timer 没有业务 Value，不匹配 Value 条件。");
         mapKeyFilter.setToolTipText(textHelp + " 仅匹配 Map 状态。");
-        timerFromFilter.setToolTipText("可选 Unix 毫秒时间戳，包含起始值；填写任一 Timer 时间条件时仅查询 Timer。");
-        timerToFilter.setToolTipText("可选 Unix 毫秒时间戳，包含截止值；起始时间不能大于截止时间。");
+        String timeHelp = "Unix 毫秒整数或带时区的 ISO 8601 时间（如 2026-01-01T00:00:00Z）；留空不限制。";
+        timerFromFilter.setToolTipText(timeHelp + " 范围包含起始值；填写 Timer 时间后仅查询 Timer。");
+        timerToFilter.setToolTipText(timeHelp + " 范围包含截止值；起始时间不能大于截止时间。");
         panel.add(filters, BorderLayout.NORTH);
         samplesTable.setAutoResizeMode(JTable.AUTO_RESIZE_OFF);
-        int[] sampleWidths = {130, 130, 130, 210, 135, 115, 105, 145, 75, 230, 265, 265};
+        int[] sampleWidths = {130, 130, 130, 190, 145, 140, 105, 145, 75, 230, 265, 265};
         for (int i = 0; i < sampleWidths.length; i++) samplesTable.getColumnModel().getColumn(i).setPreferredWidth(sampleWidths[i]);
         panel.add(new JScrollPane(samplesTable), BorderLayout.CENTER);
         JPanel information = new JPanel(new BorderLayout(0, 5));
-        JPanel pages = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        pages.add(previousPage);
-        pages.add(nextPage);
-        pages.add(pagePosition);
+        JPanel pages = new JPanel(new BorderLayout(5, 0));
+        JPanel navigation = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        navigation.add(previousPage);
+        navigation.add(nextPage);
+        pages.add(navigation, BorderLayout.WEST);
+        pages.add(pagePosition, BorderLayout.CENTER);
+        pages.add(viewDiagnostics, BorderLayout.EAST);
         pagePosition.setForeground(MUTED);
         pagePosition.setToolTipText("翻页使用后台返回的游标。每页最多返回设置的条数，也可能受内存限制提前分页；不表示状态总记录数。");
         information.add(pages, BorderLayout.NORTH);
@@ -404,7 +428,9 @@ public final class StateLensFrame extends JFrame {
 
     private static JPanel filterField(String label, JComponent field) {
         JPanel panel = new JPanel(new BorderLayout(5, 0));
-        panel.add(new JLabel(label), BorderLayout.WEST);
+        JLabel caption = new JLabel(label);
+        caption.setLabelFor(field);
+        panel.add(caption, BorderLayout.WEST);
         panel.add(field, BorderLayout.CENTER);
         return panel;
     }
@@ -488,6 +514,8 @@ public final class StateLensFrame extends JFrame {
         clearJars.addActionListener(e -> { userJars.clear(); refreshJars(); });
         operatorTree.addTreeSelectionListener(e -> selectTreeNode());
         readSamples.addActionListener(e -> loadPreview());
+        applyFilters.addActionListener(e -> loadPreview());
+        viewDiagnostics.addActionListener(e -> details.setSelectedIndex(4));
         previousPage.addActionListener(e -> navigatePreview(-1));
         nextPage.addActionListener(e -> navigatePreview(1));
         stateFilter.addActionListener(e -> previewFiltersChanged());
@@ -567,7 +595,7 @@ public final class StateLensFrame extends JFrame {
 
     private void refreshJars() {
         jarSummary.setText(userJars.isEmpty() ? "未加载用户 JAR" : "已选择 " + userJars.size() + " 个 JAR（下次导入生效）");
-        jarSummary.setToolTipText(userJars.isEmpty() ? null : userJars.toString());
+        jarSummary.setToolTipText(userJars.isEmpty() ? null : plainTooltip(userJars.toString()));
         updateActions();
     }
 
@@ -647,14 +675,12 @@ public final class StateLensFrame extends JFrame {
     private void renderReport() {
         snapshotMetric.setText(Long.toString(report.checkpointId()));
         snapshotTypeSummary.setText("类型：" + shortSnapshotKind(report.snapshotKind()));
-        snapshotTypeSummary.setToolTipText(report.snapshotKind());
+        snapshotTypeSummary.setToolTipText(plainTooltip(report.snapshotKind()));
         operatorMetric.setText(Integer.toString(report.operators().size()));
         referencedMetric.setText(bytes(report.referencedStateBytes()));
         checkpointedMetric.setText(bytes(report.checkpointedBytes()));
         metadataSummary.setText("运行时 " + report.runtimeVersion() + "   ·   元数据格式 v" + report.metadataVersion() + "   ·   " + report.metadataPath());
-        metadataSummary.setToolTipText(report.metadataPath().toString());
-        diagnosticsModel.setRowCount(0);
-        report.diagnostics().forEach(d -> diagnosticsModel.addRow(new Object[]{d.severity(), d.message()}));
+        metadataSummary.setToolTipText(plainTooltip(report.metadataPath().toString()));
         DefaultMutableTreeNode root = new DefaultMutableTreeNode("快照 " + report.checkpointId());
         for (SnapshotReport.OperatorReport operator : report.operators()) {
             String identity = operatorIdentity(operator);
@@ -676,8 +702,8 @@ public final class StateLensFrame extends JFrame {
         selectionSummary.setToolTipText(null);
         renderFiles();
         resetPreviewFilters(true);
-        clearPreview();
         clearQuery();
+        clearPreview();
     }
 
     private void selectTreeNode() {
@@ -701,8 +727,8 @@ public final class StateLensFrame extends JFrame {
         }
         renderFiles();
         resetPreviewFilters(true);
-        clearPreview();
         clearQuery();
+        clearPreview();
         updateActions();
         setStatus(selected == null ? "未读取 · 请选择算子和具体子任务"
                 : selected.subtask() < 0 ? "未读取 · 已展开算子，请选择具体子任务并点击“加载数据”"
@@ -728,10 +754,7 @@ public final class StateLensFrame extends JFrame {
                 : "未读取：当前子任务的 Schema 和状态数据尚未加载。点击“加载数据”读取第一页。";
         setPreviewMessage(message);
         details.setTitleAt(1, "状态 Schema");
-        if (report != null) {
-            diagnosticsModel.setRowCount(0);
-            report.diagnostics().forEach(d -> diagnosticsModel.addRow(new Object[]{d.severity(), d.message()}));
-        }
+        refreshDiagnostics();
     }
 
     private void setPreviewMessage(String message) {
@@ -743,10 +766,15 @@ public final class StateLensFrame extends JFrame {
         sampleSummary.setForeground(MUTED);
     }
 
-    private void previewCancelled() {
-        clearPreview();
-        setPreviewMessage("加载已取消，当前条件的数据页尚未加载。点击“加载数据”从第一页重试。");
-        setStatus("数据加载已取消 · 当前筛选已保留，可点击“加载数据”重试", "INFO");
+    private void previewCancelled(int targetIndex) {
+        String message = "已取消加载第 " + (targetIndex + 1) + " 页";
+        if (preview != null) {
+            updatePreviewSummaries();
+            setStatus(message + " · 保留第 " + (pageIndex + 1) + " 页，可继续翻页或重试", "INFO");
+        } else {
+            setPreviewMessage(message + "，当前筛选已保留。点击“应用筛选”或“加载数据”重试。");
+            setStatus(message + " · 当前筛选已保留", "INFO");
+        }
     }
 
     private void loadPreview() {
@@ -760,8 +788,10 @@ public final class StateLensFrame extends JFrame {
             if (from != null && to != null && from > to) throw new IllegalArgumentException("Timer 起始时间不能大于截止时间。");
             spec = new PreviewRequest((Integer) limit.getValue(), 0, state == null ? null : state.stateName(),
                     keyFilter.getText(), valueFilter.getText(), mapKeyFilter.getText(), from, to);
+            if ((from != null || to != null) && (spec.valueContains() != null || spec.mapKeyContains() != null)) {
+                throw new IllegalArgumentException("Timer 没有业务 Value 或 Map key。使用 Timer 时间条件时请清空这两项。");
+            }
         } catch (Exception error) { showFailure("数据筛选配置无效", error); return; }
-        invalidatePageData();
         loadPreviewPage(spec, 0);
     }
 
@@ -769,7 +799,14 @@ public final class StateLensFrame extends JFrame {
         String text = field.getText().trim();
         if (text.isEmpty()) return null;
         try { return Long.valueOf(text); }
-        catch (NumberFormatException error) { throw new IllegalArgumentException(label + "必须是 Unix 毫秒整数时间戳，或留空。", error); }
+        catch (NumberFormatException ignored) { /* The alternative is an ISO 8601 timestamp. */ }
+        try {
+            Instant instant = Instant.parse(text);
+            if (instant.getNano() % 1_000_000 != 0) throw new IllegalArgumentException(label + "只支持毫秒精度。");
+            return instant.toEpochMilli();
+        } catch (DateTimeException | ArithmeticException error) {
+            throw new IllegalArgumentException(label + "必须是 Unix 毫秒整数或带时区的 ISO 8601 时间（如 2026-01-01T00:00:00Z）。", error);
+        }
     }
 
     private void navigatePreview(int direction) {
@@ -791,7 +828,7 @@ public final class StateLensFrame extends JFrame {
         long request = generation;
         long revision = filterRevision;
         setPreviewMessage("正在加载子任务 " + readingSelection.subtask() + " 的 Schema 和第 " + (targetIndex + 1)
-                + " 页状态数据…" + (preview == null ? "" : " 表格暂时保留上一页，加载完成后替换。"));
+                + " 页状态数据…" + (preview == null ? "" : " 暂时显示已加载的第 " + (pageIndex + 1) + " 页。"));
         beginOperation("正在后台筛选 RocksDB 状态 · 子任务 " + readingSelection.subtask() + " · 每页最多 " + spec.limit() + " 条…", true);
         new SwingWorker<PreviewReport, Void>() {
             @Override protected PreviewReport doInBackground() throws Exception {
@@ -800,7 +837,7 @@ public final class StateLensFrame extends JFrame {
             @Override protected void done() {
                 try {
                     PreviewReport result = get();
-                    if (cancellationRequested) { previewCancelled(); return; }
+                    if (cancellationRequested) { previewCancelled(targetIndex); return; }
                     if (request != generation || revision != filterRevision || reading != session || !readingSelection.equals(selected)) return;
                     preview = result;
                     loadedPreviewRequest = spec;
@@ -811,15 +848,19 @@ public final class StateLensFrame extends JFrame {
                     details.setSelectedIndex(2);
                     setStatus("子任务 " + readingSelection.subtask() + " · 本页 " + result.entries().size() + " 条 · " + pageCoverage(result.page())
                                     + (result.warnings().isEmpty() ? "" : " · " + result.warnings().size() + " 条诊断提示"),
-                            !result.page().complete() || !result.warnings().isEmpty() ? "WARN" : "INFO");
+                            result.page().complete() ? "INFO" : "WARN");
                 } catch (Exception error) {
-                    clearPreview();
-                    if (cancellationRequested) previewCancelled();
+                    if (cancellationRequested) previewCancelled(targetIndex);
                     else {
-                        setPreviewMessage("加载失败，当前条件的数据页尚未加载。请查看“诊断”页中的错误原因；点击“加载数据”从第一页重试。");
-                        schemaSummary.setForeground(new Color(174, 45, 55));
-                        sampleSummary.setForeground(new Color(174, 45, 55));
-                        showFailure("状态数据加载失败", unwrap(error));
+                        String title = "第 " + (targetIndex + 1) + " 页加载失败";
+                        if (preview != null) {
+                            updatePreviewSummaries();
+                            title += "（保留第 " + (pageIndex + 1) + " 页）";
+                        } else {
+                            setPreviewMessage("加载失败。请查看诊断中的错误原因，然后重新加载。已有 Schema 会保留。");
+                            sampleSummary.setForeground(new Color(174, 45, 55));
+                        }
+                        showFailure(title, unwrap(error));
                     }
                 } finally { endOperation(); }
             }
@@ -832,12 +873,14 @@ public final class StateLensFrame extends JFrame {
         for (PreviewReport.StateSchema schema : preview.schemas()) schemasModel.addRow(new Object[]{schema.name(), schema.type(), schema.keySerializer(), schema.namespaceSerializer(), schema.valueSerializer()});
         for (PreviewReport.StateEntry entry : preview.entries()) samplesModel.addRow(new Object[]{entry.stateName(), entry.key(), entry.mapKey(), entry.value(), entry.timerTimestamp(), entry.timerType(), entry.namespace(), entry.ttlTimestamp(), entry.keyGroup(), entry.decodeStatus(), entry.keyHex(), entry.valueHex()});
         refreshStateChoices(preview.schemas());
-        diagnosticsModel.setRowCount(0);
-        report.diagnostics().forEach(d -> diagnosticsModel.addRow(new Object[]{d.severity(), d.message()}));
-        preview.warnings().forEach(w -> diagnosticsModel.addRow(new Object[]{"WARN", w}));
+        refreshDiagnostics();
         details.setTitleAt(1, "状态 Schema（" + preview.schemas().size() + "）");
         details.setTitleAt(2, "状态数据（本页 " + preview.entries().size() + "）");
-        String warnings = preview.warnings().isEmpty() ? "" : " · " + preview.warnings().size() + " 条警告，请查看“诊断”页确认原因";
+        updatePreviewSummaries();
+    }
+
+    private void updatePreviewSummaries() {
+        String warnings = preview.warnings().isEmpty() ? "" : " · 本页 " + preview.warnings().size() + " 条诊断提示";
         schemaSummary.setForeground(MUTED);
         schemaSummary.setText(preview.schemas().isEmpty()
                 ? "本次未返回可展示的状态 Schema" + warnings + "；这不表示算子没有状态。"
@@ -849,13 +892,15 @@ public final class StateLensFrame extends JFrame {
         PreviewReport.PageInfo page = preview.page();
         pagePosition.setText("第 " + (pageIndex + 1) + " 页 · 游标 " + page.offset() + " · 本页 " + preview.entries().size()
                 + " 条 · 本次已扫描 " + page.scanned() + " 条");
-        pagePosition.setToolTipText("本次已扫描是本次请求检查的记录数，可能包含为游标跳过的前页记录；不代表去重后的累计扫描量或状态总记录数。下一页游标：" + page.nextOffset());
-        String scope = "仅当前子任务 " + selected.subtask() + " 的支持读取的状态和当前条件，其他子任务需分别加载。";
-        String empty = preview.entries().isEmpty() ? "本页未返回符合条件的数据；不表示算子没有状态。" : "";
-        String summary = pageCoverage(page) + " · 完整解码 " + decoded + " · 部分解码 " + partial + " · 原始/失败 " + raw;
-        sampleSummary.setText("<html>" + html(summary) + "<br>" + html(empty + scope)
-                + "<br>" + html("TTL 为存储的访问时间，不判断过期。原始 HEX 可横向滚动/双击查看。" + warnings) + "</html>");
-        sampleSummary.setToolTipText(summary + "；" + empty + scope + " 条件只匹配完整解码字段；当前页不代表总记录数。" + warnings);
+        pagePosition.setToolTipText("本次已扫描是本次请求检查的记录数，不表示累计或总记录数。"
+                + (page.hasMore() ? " 下一页游标：" + page.nextOffset() : ""));
+        String stateName = Objects.toString(loadedPreviewRequest.stateName(), "全部受支持状态");
+        String scope = "子任务 " + selected.subtask() + " · " + shortText(stateName, 42) + " · 其他子任务分别加载";
+        String empty = preview.entries().isEmpty() ? "本页未返回匹配行。" : "";
+        String summary = pageCoverage(page) + " · 本页解码 " + decoded + " · 部分 " + partial + " · 原始/失败 " + raw;
+        sampleSummary.setText("<html>" + html(summary) + "<br>" + html(scope + (empty.isEmpty() ? "" : " · " + empty) + warnings) + "</html>");
+        sampleSummary.setToolTipText(plainTooltip(summary + "\n子任务 " + selected.subtask() + " · " + shortText(stateName, 260) + warnings
+                + "\n本页不代表状态总记录数。TTL 为存储的访问时间，工具不判断过期。水平滚动可查看原始 HEX。"));
         sampleSummary.setForeground(page.complete() ? MUTED : new Color(150, 98, 14));
     }
 
@@ -866,6 +911,7 @@ public final class StateLensFrame extends JFrame {
     }
 
     private void clearQuery() {
+        queryWarnings = List.of();
         queryModel.setRowCount(0);
         querySummary.setText("配置状态名和类型后，执行真实 Flink 本地有界作业。");
     }
@@ -899,15 +945,17 @@ public final class StateLensFrame extends JFrame {
             @Override protected void done() {
                 try {
                     QueryReport result = get();
-                    if (cancellationRequested) { clearQuery(); setStatus("业务状态查询已取消", "INFO"); return; }
+                    if (cancellationRequested) { clearQuery(); refreshDiagnostics(); setStatus("业务状态查询已取消", "INFO"); return; }
                     if (request != generation || reading != session || !readingSelection.equals(selected)) return;
                     queryModel.setRowCount(0);
                     result.rows().forEach(row -> queryModel.addRow(new Object[]{row.key(), row.value()}));
-                    result.warnings().forEach(w -> diagnosticsModel.addRow(new Object[]{"WARN", w}));
+                    queryWarnings = List.copyOf(result.warnings());
+                    refreshDiagnostics();
                     querySummary.setText("返回 " + result.rows().size() + " 条业务状态" + (result.truncated() ? " · 已截断" : "") + " · 整个算子，所有子任务；结果数量不代表总记录数。");
                     setStatus("业务状态查询完成 · " + result.rows().size() + " 条" + (result.warnings().isEmpty() ? "" : "，请查看诊断警告"), result.warnings().isEmpty() ? "INFO" : "WARN");
                 } catch (Exception error) {
                     clearQuery();
+                    refreshDiagnostics();
                     if (cancellationRequested) setStatus("业务状态查询已取消", "INFO");
                     else showFailure("业务状态查询失败", unwrap(error));
                 } finally { endOperation(); }
@@ -922,6 +970,7 @@ public final class StateLensFrame extends JFrame {
         pageIndex = -1;
         samplesModel.setRowCount(0);
         pagePosition.setText("尚未加载页面");
+        pagePosition.setToolTipText(null);
         details.setTitleAt(2, "状态数据");
     }
 
@@ -941,23 +990,20 @@ public final class StateLensFrame extends JFrame {
             timerToFilter.setText("");
         } finally { adjustingFilters = previousAdjustment; }
         filterRevision++;
-        invalidatePageData();
     }
 
     private void previewFiltersChanged() {
         if (adjustingFilters || busy || closing) return;
         filterRevision++;
+        boolean hadPage = preview != null;
         invalidatePageData();
         if (selected != null && selected.subtask() >= 0) {
-            setPreviewMessage("筛选或每页上限已修改，当前页已清除。点击“加载数据”从第一页应用条件；不会自动读取。");
+            setPreviewMessage("筛选或每页上限已修改。点击“应用筛选”或“加载数据”从第一页读取。");
             if (schemasModel.getRowCount() > 0) {
                 schemaSummary.setText("已保留当前子任务的 " + schemasModel.getRowCount() + " 个 Schema；点击“加载数据”应用当前筛选。");
                 schemaSummary.setToolTipText(schemaSummary.getText());
             }
-            if (report != null) {
-                diagnosticsModel.setRowCount(0);
-                report.diagnostics().forEach(d -> diagnosticsModel.addRow(new Object[]{d.severity(), d.message()}));
-            }
+            if (hadPage) refreshDiagnostics();
             setStatus("筛选已修改 · 当前页和翻页游标已清除，点击“加载数据”重新读取", "INFO");
         } else clearPreview();
         updateActions();
@@ -995,7 +1041,7 @@ public final class StateLensFrame extends JFrame {
         boolean known = false;
         for (int i = 0; i < stateFilter.getItemCount(); i++) known |= choice.equals(stateFilter.getItemAt(i));
         if (!known) stateFilter.addItem(choice);
-        stateFilter.setSelectedItem(choice);
+        if (!choice.equals(stateFilter.getSelectedItem())) stateFilter.setSelectedItem(choice);
         details.setSelectedIndex(2);
     }
 
@@ -1003,19 +1049,23 @@ public final class StateLensFrame extends JFrame {
         int row = schemasTable.getSelectedRow();
         if (row < 0) return;
         row = schemasTable.convertRowIndexToModel(row);
-        queryStateName.setText(Objects.toString(schemasModel.getValueAt(row, 0), ""));
         String type = Objects.toString(schemasModel.getValueAt(row, 1), "").toUpperCase(java.util.Locale.ROOT);
         for (LocalStreamQueryService.Kind kind : LocalStreamQueryService.Kind.values()) {
-            if (type.contains(kind.name())) { queryKind.setSelectedItem(kind); break; }
+            if (type.equals(kind.name())) {
+                queryStateName.setText(Objects.toString(schemasModel.getValueAt(row, 0), ""));
+                queryKind.setSelectedItem(kind);
+                querySummary.setText("已从 Schema 填入状态名；请核对 Key / Value 类型后执行本地解析。");
+                return;
+            }
         }
-        querySummary.setText("已从 Schema 填入状态名；请核对 Key / Value 类型后执行本地解析。");
     }
 
     private void saveReport() {
         if (busy || report == null) return;
         Path target = exportTarget("导出本地分析报告", "flink-state-report.json", ".json");
         if (target == null) return;
-        ReportExport document = new ReportExport(APP, report, selected == null ? null : selected.operatorId(), selected == null || selected.subtask() < 0 ? null : selected.subtask(), preview);
+        ReportExport document = new ReportExport(APP, report, selected == null ? null : selected.operatorId(),
+                selected == null || selected.subtask() < 0 ? null : selected.subtask(), preview, loadedPreviewRequest);
         runExport(target, () -> new ObjectMapper().writerWithDefaultPrettyPrinter().writeValue(target.toFile(), document));
     }
 
@@ -1124,6 +1174,7 @@ public final class StateLensFrame extends JFrame {
         stateFilter.setEnabled(previewEditable);
         for (JTextField field : List.of(keyFilter, valueFilter, mapKeyFilter, timerFromFilter, timerToFilter)) field.setEnabled(previewEditable);
         resetFilters.setEnabled(previewEditable);
+        applyFilters.setEnabled(previewEditable);
         useSchemaFilter.setEnabled(previewEditable && schemasTable.getSelectedRow() >= 0);
         readSamples.setEnabled(previewEditable);
         previousPage.setEnabled(previewEditable && preview != null && loadedPreviewRequest != null && pageIndex > 0);
@@ -1206,7 +1257,8 @@ public final class StateLensFrame extends JFrame {
     private void showFailure(String title, Throwable error) {
         String message = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
         setStatus(title + " · " + message, "ERROR");
-        diagnosticsModel.addRow(new Object[]{"ERROR", title + "：" + message});
+        diagnosticsModel.addRow(new Object[]{"操作", "ERROR", title + "：" + message});
+        updateDiagnosticsCount();
         if (!closing) {
             JTextArea text = new JTextArea(message, 5, 65);
             text.setEditable(false);
@@ -1216,9 +1268,28 @@ public final class StateLensFrame extends JFrame {
         }
     }
 
+    private void refreshDiagnostics() {
+        diagnosticsModel.setRowCount(0);
+        if (report != null) report.diagnostics().forEach(d -> diagnosticsModel.addRow(new Object[]{"快照", d.severity(), d.message()}));
+        if (preview != null) {
+            String scope = "状态数据 · 第 " + (pageIndex + 1) + " 页";
+            String severity = preview.page().complete() ? "INFO" : "WARN";
+            preview.warnings().forEach(w -> diagnosticsModel.addRow(new Object[]{scope, severity, w}));
+        }
+        queryWarnings.forEach(w -> diagnosticsModel.addRow(new Object[]{"业务状态查询", "WARN", w}));
+        updateDiagnosticsCount();
+    }
+
+    private void updateDiagnosticsCount() {
+        int count = diagnosticsModel.getRowCount();
+        details.setTitleAt(4, count == 0 ? "诊断" : "诊断（" + count + "）");
+        viewDiagnostics.setText(count == 0 ? "查看诊断" : "查看诊断（" + count + "）");
+        viewDiagnostics.setEnabled(count > 0);
+    }
+
     private void setStatus(String message, String severity) {
         status.setText(message);
-        status.setToolTipText(message);
+        status.setToolTipText(plainTooltip(message));
         status.setForeground("ERROR".equals(severity) ? new Color(174, 45, 55) : "WARN".equals(severity) ? new Color(150, 98, 14) : MUTED);
     }
 
@@ -1271,6 +1342,11 @@ public final class StateLensFrame extends JFrame {
     private static String html(String value) {
         return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
                 .replace("\"", "&quot;").replace("'", "&#39;");
+    }
+
+    private static String plainTooltip(String value) {
+        return value == null ? null : "<html>" + html(value).replace("\r\n", "\n").replace('\r', '\n')
+                .replace("\n", "<br>") + "</html>";
     }
 
     static String shortSnapshotKind(String kind) {
@@ -1331,9 +1407,32 @@ public final class StateLensFrame extends JFrame {
     }
 
     private static DefaultTableModel readOnlyModel(String... columns) {
+        return readOnlyModel(Map.of(), columns);
+    }
+
+    private static DefaultTableModel readOnlyModel(Map<Integer, Class<?>> columnTypes, String... columns) {
         return new DefaultTableModel(columns, 0) {
             @Override public boolean isCellEditable(int row, int column) { return false; }
+            @Override public Class<?> getColumnClass(int column) { return columnTypes.getOrDefault(column, Object.class); }
         };
+    }
+
+    private static DefaultTableCellRenderer literalCellRenderer() {
+        DefaultTableCellRenderer renderer = new DefaultTableCellRenderer() {
+            @Override protected void setValue(Object value) {
+                setHorizontalAlignment(value instanceof Number ? RIGHT : LEFT);
+                if (value instanceof String text) super.setValue(text.isEmpty() ? "\"\"" : shortText(text, 260));
+                else super.setValue(value == null ? "—" : value);
+            }
+        };
+        // Swing otherwise treats user-controlled strings beginning with <html> as markup.
+        renderer.putClientProperty("html.disable", Boolean.TRUE);
+        return renderer;
+    }
+
+    private static String timestampHint(JTable table, int column, Object value) {
+        return value instanceof Long millis && table.getColumnName(column).endsWith("（ms）")
+                ? "UTC：" + Instant.ofEpochMilli(millis) : null;
     }
 
     private static JTable table(DefaultTableModel model) {
@@ -1342,10 +1441,16 @@ public final class StateLensFrame extends JFrame {
                 int row = rowAtPoint(event.getPoint());
                 int column = columnAtPoint(event.getPoint());
                 if (row < 0 || column < 0) return null;
-                String value = Objects.toString(getValueAt(row, column), "");
-                return (value.length() > 350 ? value.substring(0, 350) + "…" : value) + "  （双击查看完整内容）";
+                Object cell = getValueAt(row, column);
+                String value = cell == null ? "此字段无值或无法读取" : cell instanceof String s && s.isEmpty() ? "空字符串" : shortText(cell.toString(), 260);
+                String time = timestampHint(this, column, cell);
+                return plainTooltip(value + (time == null ? "" : "\n" + time) + "\n双击查看此单元格已读取内容");
             }
         };
+        DefaultTableCellRenderer renderer = literalCellRenderer();
+        table.setDefaultRenderer(Object.class, renderer);
+        table.setDefaultRenderer(Long.class, renderer);
+        table.setDefaultRenderer(Integer.class, renderer);
         table.setRowHeight(27);
         table.setShowGrid(false);
         table.setIntercellSpacing(new Dimension(8, 1));
@@ -1359,13 +1464,17 @@ public final class StateLensFrame extends JFrame {
                 int row = table.rowAtPoint(event.getPoint());
                 int column = table.columnAtPoint(event.getPoint());
                 if (row < 0 || column < 0) return;
-                String value = Objects.toString(table.getValueAt(row, column), "");
-                JTextArea text = new JTextArea(value, 18, 85);
+                Object cell = table.getValueAt(row, column);
+                String value = Objects.toString(cell, "");
+                JTextArea text = new JTextArea(value, 16, 75);
                 text.setEditable(false);
                 text.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 13));
                 text.setCaretPosition(0);
                 text.setTabSize(2);
-                JButton copy = new JButton("复制全部内容");
+                boolean wrapInitially = value.length() <= 65_536;
+                text.setLineWrap(wrapInitially);
+                JButton copy = new JButton("复制内容");
+                copy.setEnabled(cell != null);
                 copy.addActionListener(e -> {
                     try {
                         Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new java.awt.datatransfer.StringSelection(value), null);
@@ -1373,14 +1482,20 @@ public final class StateLensFrame extends JFrame {
                     } catch (RuntimeException error) { copy.setText("复制失败，可选中文本复制"); }
                 });
                 JPanel detail = new JPanel(new BorderLayout(0, 8));
+                String time = timestampHint(table, column, cell);
+                if (time != null) detail.add(new JLabel(time + " · 复制原始毫秒值"), BorderLayout.NORTH);
+                else if (value.isEmpty()) detail.add(new JLabel(cell == null ? "此字段无值或无法读取" : "空字符串"), BorderLayout.NORTH);
                 detail.add(new JScrollPane(text), BorderLayout.CENTER);
-                JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+                JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 8, 0));
+                JCheckBox wrap = new JCheckBox("自动换行", wrapInitially);
+                wrap.addActionListener(e -> text.setLineWrap(wrap.isSelected()));
+                actions.add(wrap);
                 actions.add(copy);
                 detail.add(actions, BorderLayout.SOUTH);
                 JOptionPane.showMessageDialog(table, detail, table.getColumnName(column) + " · 只读详情", JOptionPane.PLAIN_MESSAGE);
             }
         });
-        table.setToolTipText("双击单元格查看完整内容并复制。");
+        table.setToolTipText("双击单元格查看已读取的内容并复制。");
         return table;
     }
 
@@ -1413,7 +1528,12 @@ public final class StateLensFrame extends JFrame {
     }
 
     public record ReportExport(String tool, SnapshotReport snapshot, String selectedOperatorId,
-                               Integer selectedSubtask, PreviewReport boundedPreview) {}
+                               Integer selectedSubtask, PreviewReport boundedPreview, PreviewRequest appliedPreviewRequest) {
+        public ReportExport(String tool, SnapshotReport snapshot, String selectedOperatorId,
+                            Integer selectedSubtask, PreviewReport boundedPreview) {
+            this(tool, snapshot, selectedOperatorId, selectedSubtask, boundedPreview, null);
+        }
+    }
 
     @FunctionalInterface private interface ExportAction { void run() throws Exception; }
 }

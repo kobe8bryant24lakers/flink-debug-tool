@@ -212,13 +212,11 @@ final class PreviewDecoder {
                 MapSerializer<?, ?> mapSerializer = stateSerializer instanceof MapSerializer<?, ?> map ? map : null;
                 boolean keyDecoded = false;
                 boolean valueDecoded = false;
-                if (scalarSupported(schema.keySerializer) && scalarSupported(schema.namespaceSerializer)) {
+                if (scalarSupported(schema.keySerializer) && compositeNamespaceSupported(schema.namespaceSerializer)) {
                     boolean ambiguous = CompositeKeySerializationUtils.isAmbiguousKeyPossible(
                             schema.keySerializer, schema.namespaceSerializer);
-                    validateScalar(schema.keySerializer, keyView, key.bytes);
-                    Object decodedKey = CompositeKeySerializationUtils.readKey(schema.keySerializer, keyView, ambiguous);
-                    validateScalar(schema.namespaceSerializer, keyView, key.bytes);
-                    Object decodedNamespace = CompositeKeySerializationUtils.readNamespace(schema.namespaceSerializer, keyView, ambiguous);
+                    Object decodedKey = readCompositeField(schema.keySerializer, keyView, key.bytes, ambiguous, "key");
+                    Object decodedNamespace = readCompositeField(schema.namespaceSerializer, keyView, key.bytes, ambiguous, "namespace");
                     String decodedMapKey = null;
                     if (isMap && mapSerializer != null) {
                         decodedMapKey = render(readKnown(mapSerializer.getKeySerializer(), keyView, key.bytes, 0));
@@ -234,8 +232,18 @@ final class PreviewDecoder {
                         : schema.valueSerializer;
                 if (valueSerializer != null) {
                     DataInputDeserializer valueView = new DataInputDeserializer(value.bytes);
-                    Object decodedValue = isMap && readNullFlag(valueView) ? null
-                            : readKnown(valueSerializer, valueView, value.bytes, 0);
+                    Object decodedValue;
+                    if (isMap && readNullFlag(valueView)) {
+                        decodedValue = null;
+                        // Canonical snapshots carry the enclosing key group's ID. The heap
+                        // canonical writer can serialize null after the flag; RocksDB does not.
+                        if (expectedKeyGroup >= 0 && valueView.available() > 0
+                                && readKnown(valueSerializer, valueView, value.bytes, 0) != null) {
+                            throw new IOException("null map value marker disagrees with canonical payload");
+                        }
+                    } else {
+                        decodedValue = readKnown(valueSerializer, valueView, value.bytes, 0);
+                    }
                     requireConsumed(valueView, "value");
                     if (decodedValue instanceof TtlData ttl) {
                         ttlTimestamp = ttl.timestamp();
@@ -286,6 +294,30 @@ final class PreviewDecoder {
         if (serializer == null) return false;
         String name = serializer.getClass().getName();
         return name.equals(VOID_NAMESPACE) || SCALAR_NAMES.stream().anyMatch(s -> name.equals(BASE + s + "Serializer"));
+    }
+
+    private static boolean compositeNamespaceSupported(TypeSerializer<?> serializer) {
+        if (serializer == null) return false;
+        String name = serializer.getClass().getName();
+        return scalarSupported(serializer) || name.equals(TIME_WINDOW) || name.equals(GLOBAL_WINDOW);
+    }
+
+    private static Object readCompositeField(TypeSerializer<?> serializer, DataInputDeserializer input,
+                                             byte[] backing, boolean ambiguous, String field) throws Exception {
+        int start = input.getPosition();
+        Object value = readKnown(serializer, input, backing, 0);
+        if (ambiguous) {
+            // Flink writes the serialized byte count in little-endian order when both fields
+            // are variable length. Check the marker rather than just skipping its bytes.
+            int length = input.getPosition() - start;
+            do {
+                if (input.readUnsignedByte() != (length & 0xff)) {
+                    throw new IOException("invalid composite " + field + " length marker");
+                }
+                length >>>= 8;
+            } while (length != 0);
+        }
+        return value;
     }
 
     private static Object readKnown(TypeSerializer<?> original, DataInputDeserializer input,

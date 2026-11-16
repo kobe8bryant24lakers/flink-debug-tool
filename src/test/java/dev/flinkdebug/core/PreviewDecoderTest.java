@@ -141,6 +141,69 @@ public class PreviewDecoderTest {
         assertEquals("12345", entry.value());
     }
 
+    @Test void windowedStringMapStateExposesTheKeyNamespaceAndMapEntry() throws Exception {
+        Fixture fixture = fixture("fixture-window-key", StringSerializer.INSTANCE,
+                new TimeWindow(1200L, 1800L), new TimeWindow.Serializer(),
+                "fixture-map-key", StringSerializer.INSTANCE, StringSerializer.INSTANCE);
+
+        PreviewReport.StateEntry entry = fixture.decode(mapValue("fixture-map-value", StringSerializer.INSTANCE));
+
+        assertDecoded(entry);
+        assertEquals("fixture-window-key", entry.key());
+        assertEquals("fixture-map-key", entry.mapKey());
+        assertEquals("fixture-map-value", entry.value());
+        JsonNode namespace = new ObjectMapper().readTree(entry.namespace());
+        assertEquals(1200L, namespace.required("start").longValue());
+        assertEquals(1800L, namespace.required("end").longValue());
+    }
+
+    @Test void globalWindowValueStateExposesTheKeyAndNamespace() throws Exception {
+        String businessKey = "fixture-global-key";
+        StringSerializer keySerializer = StringSerializer.INSTANCE;
+        var namespaceSerializer = new GlobalWindow.Serializer();
+        var keyedSchema = stateSchema(keySerializer, namespaceSerializer, StringSerializer.INSTANCE, "VALUE");
+        int group = KeyGroupRangeAssignment.assignToKeyGroup(businessKey, MAX_PARALLELISM);
+        int prefix = CompositeKeySerializationUtils.computeRequiredBytesInKeyGroupPrefix(MAX_PARALLELISM);
+        var keyBuilder = new SerializedCompositeKeyBuilder<>(keySerializer, prefix, 64);
+        keyBuilder.setKeyAndKeyGroup(businessKey, group);
+        var fixture = new Fixture(keyedSchema,
+                keyBuilder.buildCompositeKeyNamespace(GlobalWindow.get(), namespaceSerializer), group, prefix);
+        var value = new DataOutputSerializer(32);
+        StringSerializer.INSTANCE.serialize("fixture-global-value", value);
+
+        PreviewReport.StateEntry entry = fixture.decode(value.getCopyOfBuffer());
+
+        assertDecoded(entry);
+        assertEquals(businessKey, entry.key());
+        assertEquals("GlobalWindow", entry.namespace());
+        assertEquals("fixture-global-value", entry.value());
+        assertNull(entry.mapKey());
+    }
+
+    @Test void corruptVariableLengthKeyAndNamespaceMarkersAreRejected() throws Exception {
+        String businessKey = "fixture-key-" + "k".repeat(300);
+        String namespace = "fixture-namespace-" + "n".repeat(300);
+        Fixture fixture = fixture(businessKey, StringSerializer.INSTANCE,
+                namespace, StringSerializer.INSTANCE, "entry", StringSerializer.INSTANCE, IntSerializer.INSTANCE);
+        byte[] value = mapValue(42, IntSerializer.INSTANCE);
+        var serialized = new DataOutputSerializer(512);
+        StringSerializer.INSTANCE.serialize(businessKey, serialized);
+        int keyMarker = fixture.prefix() + serialized.length();
+        assertTrue(serialized.length() > 255);
+        serialized.clear();
+        StringSerializer.INSTANCE.serialize(namespace, serialized);
+        int namespaceMarker = keyMarker + 2 + serialized.length();
+        assertTrue(serialized.length() > 255);
+        for (int marker : List.of(keyMarker, keyMarker + 1, namespaceMarker, namespaceMarker + 1)) {
+            byte[] corrupt = fixture.key().clone();
+            corrupt[marker] ^= 1;
+            PreviewReport.StateEntry entry = fixture.decode(corrupt, value);
+            assertDecodeFailed(entry);
+            assertTrue(entry.decodeStatus().contains("length marker"), entry::decodeStatus);
+            assertNull(entry.key());
+        }
+    }
+
     @Test void truncatedMapKeyClearlyFailsDecoding() throws Exception {
         Fixture fixture = scalarFixture();
         byte[] key = Arrays.copyOf(fixture.key(), fixture.key().length - 1);
@@ -188,6 +251,29 @@ public class PreviewDecoderTest {
         PreviewReport.StateEntry entry = fixture.decode(appendByte(mapValue(null, LongSerializer.INSTANCE)));
 
         assertDecodeFailed(entry);
+    }
+
+    @Test void canonicalMapNullCanIncludeTheValueSerializerNullEncoding() throws Exception {
+        Fixture fixture = fixture("fixture-key", StringSerializer.INSTANCE,
+                VoidNamespace.INSTANCE, VoidNamespaceSerializer.INSTANCE,
+                "fixture-map-key", StringSerializer.INSTANCE, StringSerializer.INSTANCE);
+        var value = new DataOutputSerializer(16);
+        value.writeBoolean(true);
+        // Flink HeapKeyValueStateIterator writes this serializer payload even for a null value.
+        StringSerializer.INSTANCE.serialize(null, value);
+        byte[] heapValue = value.getCopyOfBuffer();
+
+        PreviewReport.StateEntry entry = fixture.decode(heapValue);
+
+        assertDecoded(entry);
+        assertEquals("null", entry.value());
+        assertEquals("fixture-map-key", entry.mapKey());
+        assertDecodeFailed(fixture.decode(fixture.key(), heapValue, -1));
+        assertDecodeFailed(fixture.decode(appendByte(heapValue)));
+        value.clear();
+        value.writeBoolean(true);
+        StringSerializer.INSTANCE.serialize("not null", value);
+        assertDecodeFailed(fixture.decode(value.getCopyOfBuffer()));
     }
 
     @Test void nullablePojoFieldIsRenderedAsJsonNull() throws Exception {
@@ -393,24 +479,29 @@ public class PreviewDecoderTest {
                                                MK mapKey, TypeSerializer<MK> mapKeySerializer,
                                                TypeSerializer<V> valueSerializer) throws Exception {
         MapSerializer<MK, V> mapSerializer = new MapSerializer<>(mapKeySerializer, valueSerializer);
-        StateMetaInfoSnapshot metadata = new StateMetaInfoSnapshot(STATE_NAME,
-                StateMetaInfoSnapshot.BackendStateType.KEY_VALUE,
-                Map.of(KEYED_STATE_TYPE.toString(), "MAP"),
-                Map.of(NAMESPACE_SERIALIZER.toString(), namespaceSerializer.snapshotConfiguration(),
-                        VALUE_SERIALIZER.toString(), mapSerializer.snapshotConfiguration()));
-        DataOutputSerializer metadataBytes = new DataOutputSerializer(256);
-        new KeyedBackendSerializationProxy<>(keySerializer, List.of(metadata), false).write(metadataBytes);
-        KeyedBackendSerializationProxy<K> restored = new KeyedBackendSerializationProxy<>(PreviewDecoderTest.class.getClassLoader());
-        restored.read(new DataInputDeserializer(metadataBytes.getCopyOfBuffer()));
-        assertInstanceOf(MapSerializerSnapshot.class,
-                restored.getStateMetaInfoSnapshots().get(0).getTypeSerializerSnapshot(VALUE_SERIALIZER));
-        PreviewDecoder.Schema schema = PreviewDecoder.schemas(restored).get(0);
+        PreviewDecoder.Schema schema = stateSchema(keySerializer, namespaceSerializer, mapSerializer, "MAP");
+        assertInstanceOf(MapSerializerSnapshot.class, schema.metadata().getTypeSerializerSnapshot(VALUE_SERIALIZER));
         int keyGroup = KeyGroupRangeAssignment.assignToKeyGroup(businessKey, MAX_PARALLELISM);
         int prefix = CompositeKeySerializationUtils.computeRequiredBytesInKeyGroupPrefix(MAX_PARALLELISM);
         SerializedCompositeKeyBuilder<K> keyBuilder = new SerializedCompositeKeyBuilder<>(keySerializer, prefix, 64);
         keyBuilder.setKeyAndKeyGroup(businessKey, keyGroup);
         byte[] key = keyBuilder.buildCompositeKeyNamesSpaceUserKey(namespace, namespaceSerializer, mapKey, mapKeySerializer);
         return new Fixture(schema, key, keyGroup, prefix);
+    }
+
+    private static <K> PreviewDecoder.Schema stateSchema(TypeSerializer<K> keySerializer,
+                                                         TypeSerializer<?> namespaceSerializer,
+                                                         TypeSerializer<?> valueSerializer, String type) throws Exception {
+        StateMetaInfoSnapshot metadata = new StateMetaInfoSnapshot(STATE_NAME,
+                StateMetaInfoSnapshot.BackendStateType.KEY_VALUE,
+                Map.of(KEYED_STATE_TYPE.toString(), type),
+                Map.of(NAMESPACE_SERIALIZER.toString(), namespaceSerializer.snapshotConfiguration(),
+                        VALUE_SERIALIZER.toString(), valueSerializer.snapshotConfiguration()));
+        DataOutputSerializer metadataBytes = new DataOutputSerializer(256);
+        new KeyedBackendSerializationProxy<>(keySerializer, List.of(metadata), false).write(metadataBytes);
+        KeyedBackendSerializationProxy<K> restored = new KeyedBackendSerializationProxy<>(PreviewDecoderTest.class.getClassLoader());
+        restored.read(new DataInputDeserializer(metadataBytes.getCopyOfBuffer()));
+        return PreviewDecoder.schemas(restored).get(0);
     }
 
     /** A single native MAP entry has its own null marker; it is not a serialized whole Map. */
@@ -442,9 +533,13 @@ public class PreviewDecoderTest {
         }
 
         PreviewReport.StateEntry decode(byte[] suppliedKey, byte[] value) {
+            return decode(suppliedKey, value, keyGroup);
+        }
+
+        PreviewReport.StateEntry decode(byte[] suppliedKey, byte[] value, int expectedGroup) {
             return PreviewDecoder.entry(STATE_NAME, schema,
                     new PreviewDecoder.RawBytes(suppliedKey, suppliedKey.length),
-                    new PreviewDecoder.RawBytes(value, value.length), keyGroup, prefix);
+                    new PreviewDecoder.RawBytes(value, value.length), expectedGroup, prefix);
         }
     }
 

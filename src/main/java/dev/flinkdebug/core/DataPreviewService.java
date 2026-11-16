@@ -32,10 +32,11 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import static org.apache.flink.runtime.state.CompositeKeySerializationUtils.computeRequiredBytesInKeyGroupPrefix;
 import static org.apache.flink.runtime.state.CompositeKeySerializationUtils.readKeyGroup;
@@ -56,6 +57,13 @@ public final class DataPreviewService {
     public PreviewReport preview(SnapshotSession session, String operatorId, int subtask, PreviewRequest request) throws Exception {
         if (session == null) throw new IllegalArgumentException("Open a snapshot first");
         if (request == null) throw new IllegalArgumentException("Specify a page request");
+        synchronized (session) {
+            session.requireOpen();
+            return previewLocked(session, operatorId, subtask, request);
+        }
+    }
+
+    private PreviewReport previewLocked(SnapshotSession session, String operatorId, int subtask, PreviewRequest request) throws Exception {
         checkCancelled();
         OperatorState operator = session.metadata().getOperatorStates().stream()
                 .filter(state -> state.getOperatorID().toHexString().equalsIgnoreCase(operatorId))
@@ -66,9 +74,19 @@ public final class DataPreviewService {
         Sample sample = new Sample(request);
         OperatorSubtaskState state = operator.getState(subtask);
         if (state == null) {
+            discardCopy(session.previewRocksCache(), sample);
             sample.warn("This subtask has no saved state.");
             return sample.report();
         }
+        KeyedStateHandle singleHandle = state.getManagedKeyedState().size() == 1
+                ? state.getManagedKeyedState().iterator().next() : null;
+        PreviewRocksCache cache = singleHandle instanceof IncrementalRemoteKeyedStateHandle
+                ? session.previewRocksCache() : null;
+        if (cache == null || !cache.owns((IncrementalRemoteKeyedStateHandle) singleHandle)) {
+            discardCopy(session.previewRocksCache(), sample);
+        }
+        PreviewRocksCache.Query query = cache == null ? null
+                : PreviewRocksCache.Query.of(operator.getOperatorID().toHexString(), subtask, request);
         if (!state.getRawKeyedState().isEmpty()) sample.incomplete("Raw keyed state is not decoded; this reader covers managed keyed state only.");
         if (!state.getManagedOperatorState().isEmpty() || !state.getRawOperatorState().isEmpty()) {
             sample.incomplete("Operator/list/broadcast state payloads are not read by this keyed-state reader.");
@@ -104,7 +122,7 @@ public final class DataPreviewService {
                 if (handle.handle() instanceof KeyGroupsSavepointStateHandle canonical) {
                     readCanonical(session, canonical, handle, prefixBytes, sample);
                 } else if (handle.handle() instanceof IncrementalRemoteKeyedStateHandle incremental) {
-                    readIncremental(session, incremental, handle, prefixBytes, sample);
+                    readIncremental(session, incremental, handle, prefixBytes, sample, cache, query);
                 }
             } catch (InterruptedException cancellation) {
                 throw cancellation;
@@ -197,87 +215,165 @@ public final class DataPreviewService {
     }
 
     private void readIncremental(SnapshotSession session, IncrementalRemoteKeyedStateHandle handle,
-                                 PreparedHandle prepared, int prefixBytes, Sample sample) throws Exception {
+                                 PreparedHandle prepared, int prefixBytes, Sample sample,
+                                 PreviewRocksCache cache, PreviewRocksCache.Query query) throws Exception {
         Map<String, PreviewDecoder.Schema> schemas = new LinkedHashMap<>();
         for (PreviewDecoder.Schema schema : prepared.schemas()) schemas.put(schema.report().name(), schema);
-        Path temporary = Files.createTempDirectory("flink-state-preview-");
+        List<HandleAndLocalPath> files = new ArrayList<>(handle.getSharedState());
+        files.addAll(handle.getPrivateState());
+        if (files.isEmpty()) throw new IOException("Incremental snapshot contains no RocksDB files");
+
+        // Without original metadata we can still show raw rows, but cannot reuse a decoder or anchor.
+        if (cache != null && prepared.proxy() == null) {
+            discardCopy(cache, sample);
+            cache = null;
+        }
+        List<PreviewRocksCache.SourceFile> stamps = null;
+        if (cache != null) {
+            try {
+                stamps = PreviewRocksCache.fingerprint(session, handle, files);
+            } catch (IOException unavailable) {
+                discardCopy(cache, sample);
+                throw unavailable;
+            }
+            if (cache.owns(handle) && !cache.current(stamps)) {
+                discardCopy(cache, sample);
+                if (sample.request.offset() > 0) {
+                    sample.incomplete("Snapshot files changed since the previous page; pagination was restarted by offset. "
+                            + "Reload from the first page for consistent results.");
+                }
+            }
+        }
+
+        boolean reuse = cache != null && cache.owns(handle);
+        Path temporary = reuse ? cache.directory() : Files.createTempDirectory("flink-state-preview-");
         try {
-            List<HandleAndLocalPath> files = new ArrayList<>(handle.getSharedState());
-            files.addAll(handle.getPrivateState());
-            if (files.isEmpty()) throw new IOException("Incremental snapshot contains no RocksDB files");
-            for (HandleAndLocalPath file : files) {
-                checkCancelled();
-                copyFile(session, file, temporary);
+            if (!reuse) {
+                for (HandleAndLocalPath file : files) {
+                    checkCancelled();
+                    copyFile(session, file, temporary);
+                }
+                if (cache != null && !stamps.equals(PreviewRocksCache.fingerprint(session, handle, files))) {
+                    throw new IOException("RocksDB source files changed while the private copy was created");
+                }
+            }
+            PreviewRocksCache.Continuation resume = reuse ? cache.resume(query, sample.request.offset()) : null;
+            PreviewRocksCache.Position next;
+            try {
+                next = scanRocks(temporary, handle, schemas, prefixBytes, sample, resume);
+            } catch (CannotResume ignored) {
+                // An anchor is only an optimization. If it cannot be resolved, retry the stateless offset.
+                next = scanRocks(temporary, handle, schemas, prefixBytes, sample, null);
             }
             checkCancelled();
-            RocksDB.loadLibrary();
-            List<byte[]> families;
-            try (Options options = new Options().setCreateIfMissing(false)) {
-                families = RocksDB.listColumnFamilies(options, temporary.toString());
+            if (cache != null) {
+                var continuation = next == null ? null : new PreviewRocksCache.Continuation(
+                        query, sample.request.offset() + sample.entries.size(), next, List.copyOf(sample.coverageGaps));
+                cache.publish(handle, stamps, temporary, continuation);
             }
-            List<ColumnFamilyOptions> familyOptions = new ArrayList<>();
-            List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
-            List<ColumnFamilyHandle> familyHandles = new ArrayList<>();
-            try {
-                for (byte[] family : families) {
-                    ColumnFamilyOptions options = new ColumnFamilyOptions();
-                    familyOptions.add(options);
-                    descriptors.add(new ColumnFamilyDescriptor(family, options));
-                }
-                try (DBOptions dbOptions = new DBOptions().setCreateIfMissing(false).setParanoidChecks(true);
-                     ReadOptions reads = new ReadOptions().setVerifyChecksums(true).setFillCache(false)) {
-                    RocksDB db = RocksDB.openReadOnly(dbOptions, temporary.toString(), descriptors, familyHandles, true);
-                    try {
-                        ByteBuffer buffer = ByteBuffer.allocateDirect(PreviewDecoder.MAX_RECORD_BYTES);
-                        byte[] firstGroupPrefix = new byte[prefixBytes];
-                        serializeKeyGroup(handle.getKeyGroupRange().getStartKeyGroup(), firstGroupPrefix);
-                        for (byte[] family : families) {
-                            String name = new String(family, StandardCharsets.UTF_8);
-                            if (!schemas.containsKey(name) && !Arrays.equals(family, RocksDB.DEFAULT_COLUMN_FAMILY)) {
-                                sample.schema(new PreviewReport.StateSchema(name, "UNKNOWN", "unknown", "unknown", "unknown"));
-                            }
+        } catch (InterruptedException cancellation) {
+            throw cancellation;
+        } catch (Exception | LinkageError failure) {
+            if (reuse) discardCopy(cache, sample);
+            throw failure;
+        } finally {
+            if (cache == null || !temporary.equals(cache.directory())) deleteTemporary(temporary, sample);
+        }
+    }
+
+    private static final class CannotResume extends Exception {}
+
+    private PreviewRocksCache.Position scanRocks(Path temporary, IncrementalRemoteKeyedStateHandle handle,
+                                                 Map<String, PreviewDecoder.Schema> schemas, int prefixBytes,
+                                                 Sample sample, PreviewRocksCache.Continuation resume) throws Exception {
+        checkCancelled();
+        RocksDB.loadLibrary();
+        List<byte[]> families;
+        try (Options options = new Options().setCreateIfMissing(false)) {
+            families = RocksDB.listColumnFamilies(options, temporary.toString());
+        }
+        int firstFamily = resume == null ? 0 : resume.position().family();
+        if (resume != null && (firstFamily < 0 || firstFamily >= families.size())) throw new CannotResume();
+        List<ColumnFamilyOptions> familyOptions = new ArrayList<>();
+        List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
+        List<ColumnFamilyHandle> familyHandles = new ArrayList<>();
+        try {
+            for (byte[] family : families) {
+                ColumnFamilyOptions options = new ColumnFamilyOptions();
+                familyOptions.add(options);
+                descriptors.add(new ColumnFamilyDescriptor(family, options));
+            }
+            try (DBOptions dbOptions = new DBOptions().setCreateIfMissing(false).setParanoidChecks(true);
+                 ReadOptions reads = new ReadOptions().setVerifyChecksums(true).setFillCache(false)) {
+                RocksDB db = RocksDB.openReadOnly(dbOptions, temporary.toString(), descriptors, familyHandles, true);
+                try {
+                    ByteBuffer buffer = ByteBuffer.allocateDirect(PreviewDecoder.MAX_RECORD_BYTES);
+                    byte[] firstGroupPrefix = new byte[prefixBytes];
+                    serializeKeyGroup(handle.getKeyGroupRange().getStartKeyGroup(), firstGroupPrefix);
+                    for (byte[] family : families) {
+                        String name = new String(family, StandardCharsets.UTF_8);
+                        if (!schemas.containsKey(name) && !Arrays.equals(family, RocksDB.DEFAULT_COLUMN_FAMILY)) {
+                            sample.schema(new PreviewReport.StateSchema(name, "UNKNOWN", "unknown", "unknown", "unknown"));
                         }
-                        for (int index = 0; index < familyHandles.size(); index++) {
-                            checkCancelled();
-                            String name = new String(families.get(index), StandardCharsets.UTF_8);
-                            PreviewDecoder.Schema schema = schemas.get(name);
-                            boolean defaultFamily = Arrays.equals(families.get(index), RocksDB.DEFAULT_COLUMN_FAMILY);
-                            if (!sample.selects(name, schema)) continue;
-                            try (RocksIterator iterator = db.newIterator(familyHandles.get(index), reads)) {
-                                if (defaultFamily) iterator.seekToFirst();
-                                else iterator.seek(firstGroupPrefix);
-                                while (iterator.isValid()) {
-                                    checkCancelled();
-                                    PreviewDecoder.RawBytes key = iteratorBytes(iterator, buffer, true);
-                                    if (!defaultFamily) {
-                                        int group = readKeyGroup(prefixBytes, new DataInputDeserializer(key.bytes()));
-                                        // A handle's intersection may cover fewer groups than its SST files.
-                                        if (group > handle.getKeyGroupRange().getEndKeyGroup()) break;
-                                        if (!handle.getKeyGroupRange().contains(group)) throw new IOException("RocksDB key-group outside handle range");
-                                    }
-                                    if (schema == null) sample.schema(new PreviewReport.StateSchema(name, "UNKNOWN", "unknown", "unknown", "unknown"));
-                                    PreviewDecoder.RawBytes value = iteratorBytes(iterator, buffer, false);
-                                    sample.accept(PreviewDecoder.entry(name, schema, key, value, -1, prefixBytes));
-                                    if (sample.hasMore) return;
-                                    iterator.next();
-                                }
-                                iterator.status();
-                            }
-                        }
-                    } finally {
-                        // Flink also closes column-family handles before closing the database.
-                        for (ColumnFamilyHandle family : familyHandles) family.close();
-                        familyHandles.clear();
-                        db.close();
                     }
+                    for (int index = firstFamily; index < familyHandles.size(); index++) {
+                        checkCancelled();
+                        String name = new String(families.get(index), StandardCharsets.UTF_8);
+                        PreviewDecoder.Schema schema = schemas.get(name);
+                        boolean defaultFamily = Arrays.equals(families.get(index), RocksDB.DEFAULT_COLUMN_FAMILY);
+                        boolean resumingHere = resume != null && index == firstFamily;
+                        if (!sample.selects(name, schema)) {
+                            if (resumingHere) throw new CannotResume();
+                            continue;
+                        }
+                        try (RocksIterator iterator = db.newIterator(familyHandles.get(index), reads)) {
+                            if (resumingHere) {
+                                iterator.seek(resume.position().key());
+                                if (!iterator.isValid()) {
+                                    iterator.status();
+                                    throw new CannotResume();
+                                }
+                                PreviewDecoder.RawBytes firstKey = iteratorBytes(iterator, buffer, true);
+                                if (!firstKey.complete() || !Arrays.equals(firstKey.bytes(), resume.position().key())) {
+                                    throw new CannotResume();
+                                }
+                                sample.matched = resume.offset();
+                                resume.coverageGaps().forEach(sample::incomplete);
+                            } else if (defaultFamily) iterator.seekToFirst();
+                            else iterator.seek(firstGroupPrefix);
+                            while (iterator.isValid()) {
+                                checkCancelled();
+                                PreviewDecoder.RawBytes key = iteratorBytes(iterator, buffer, true);
+                                if (!defaultFamily) {
+                                    int group = readKeyGroup(prefixBytes, new DataInputDeserializer(key.bytes()));
+                                    // A handle's intersection may cover fewer groups than its SST files.
+                                    if (group > handle.getKeyGroupRange().getEndKeyGroup()) break;
+                                    if (!handle.getKeyGroupRange().contains(group)) throw new IOException("RocksDB key-group outside handle range");
+                                }
+                                if (schema == null) sample.schema(new PreviewReport.StateSchema(name, "UNKNOWN", "unknown", "unknown", "unknown"));
+                                PreviewDecoder.RawBytes value = iteratorBytes(iterator, buffer, false);
+                                sample.accept(PreviewDecoder.entry(name, schema, key, value, -1, prefixBytes));
+                                if (sample.hasMore) {
+                                    // The lookahead was not returned. Include this exact key on the next page.
+                                    return key.complete() ? new PreviewRocksCache.Position(index, key.bytes()) : null;
+                                }
+                                iterator.next();
+                            }
+                            iterator.status();
+                        }
+                    }
+                } finally {
+                    // Flink also closes column-family handles before closing the database.
+                    for (ColumnFamilyHandle family : familyHandles) family.close();
+                    familyHandles.clear();
+                    db.close();
                 }
-            } finally {
-                for (ColumnFamilyHandle family : familyHandles) family.close();
-                for (ColumnFamilyOptions options : familyOptions) options.close();
             }
         } finally {
-            deleteTemporary(temporary, sample);
+            for (ColumnFamilyHandle family : familyHandles) family.close();
+            for (ColumnFamilyOptions options : familyOptions) options.close();
         }
+        return null;
     }
 
     private static PreviewDecoder.RawBytes iteratorBytes(RocksIterator iterator, ByteBuffer buffer, boolean key) throws IOException {
@@ -315,10 +411,18 @@ public final class DataPreviewService {
     }
 
     private static void deleteTemporary(Path directory, Sample sample) {
-        try (var files = Files.walk(directory)) {
-            for (Path file : files.sorted(Comparator.reverseOrder()).toList()) Files.deleteIfExists(file);
+        try {
+            PreviewRocksCache.deleteTree(directory);
         } catch (IOException cleanupFailure) {
             sample.warn("Could not completely remove temporary RocksDB copy " + directory + ": " + safeMessage(cleanupFailure));
+        }
+    }
+
+    private static void discardCopy(PreviewRocksCache cache, Sample sample) {
+        try {
+            cache.close();
+        } catch (IOException cleanupFailure) {
+            sample.warn("Could not completely remove temporary RocksDB copy: " + safeMessage(cleanupFailure));
         }
     }
 
@@ -337,6 +441,7 @@ public final class DataPreviewService {
         final Map<PreviewReport.StateSchema, PreviewReport.StateSchema> schemas = new LinkedHashMap<>();
         final List<PreviewReport.StateEntry> entries = new ArrayList<>();
         final List<String> warnings = new ArrayList<>();
+        final Set<String> coverageGaps = new LinkedHashSet<>();
         long matched;
         long scanned;
         long retainedBytes;
@@ -416,7 +521,7 @@ public final class DataPreviewService {
         void schema(PreviewReport.StateSchema schema) { schemas.putIfAbsent(schema, schema); }
         void schemas(List<PreviewDecoder.Schema> values) { for (PreviewDecoder.Schema value : values) schema(value.report()); }
         void warn(String warning) { if (!warnings.contains(warning)) warnings.add(warning); }
-        void incomplete(String warning) { complete = false; warn(warning); }
+        void incomplete(String warning) { complete = false; coverageGaps.add(warning); warn(warning); }
         PreviewReport report() {
             return new PreviewReport(List.copyOf(schemas.values()), List.copyOf(entries), hasMore, List.copyOf(warnings),
                     new PreviewReport.PageInfo(request.offset(), request.offset() + entries.size(), scanned, hasMore, complete));
