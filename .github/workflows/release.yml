@@ -107,9 +107,10 @@ jobs:
           java-version: ${{ matrix.build-java }}
           architecture: ${{ matrix.architecture }}
           cache: maven
-      - name: Cache fixed Windows RocksDB JNI
+      - name: Restore Windows RocksDB JNI cache
+        id: windows-native-cache
         if: runner.os == 'Windows'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/windows-native
           key: windows-native-${{ matrix.runner }}-${{ runner.arch }}-${{ hashFiles('packaging/windows/**') }}
@@ -117,6 +118,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: ./packaging/windows/build-rocksdb.ps1
+      - name: Cache the verified Windows RocksDB JNI
+        if: runner.os == 'Windows' && steps.windows-native-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/windows-native
+          key: ${{ steps.windows-native-cache.outputs.cache-primary-key }}
       - name: Build and test on Windows with the replacement RocksDB JNI
         if: runner.os == 'Windows'
         shell: pwsh

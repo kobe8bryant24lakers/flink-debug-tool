@@ -10,14 +10,14 @@
 
 | 平台 | 下载文件 | 启动方式 |
 | --- | --- | --- |
-| Windows x64 | `flink-debug-tool-<版本>-windows-x64.zip` | 解压整个 ZIP，双击 `Flink State Lens.exe`。请保留同目录的 `app` 与 `runtime`。 |
+| Windows 10（1903 或更新版本）/11 x64 | `flink-debug-tool-<版本>-windows-x64.zip` | 解压整个 ZIP，双击 `Flink State Lens.exe`。请保留同目录的 `app` 与 `runtime`。 |
 | macOS Apple Silicon | `flink-debug-tool-<版本>-macos-arm64.zip` | 解压，打开 `Flink State Lens.app`。 |
 | macOS Intel | `flink-debug-tool-<版本>-macos-x64.zip` | 解压，打开 `Flink State Lens.app`。 |
 | 已有 Java 的用户 | `flink-debug-tool-<版本>.jar` | 在终端执行 `java -jar flink-debug-tool-<版本>.jar`；需要 Java 17 或更高版本。在 Windows 上使用 x64 Java。 |
 
 发布包未使用商业代码签名证书。首次打开时，Windows 或 macOS 可能提示发布方无法验证；可用 Release 中的 `SHA256SUMS.txt` 校验下载文件。若 macOS 阻止打开已校验的应用，请参照 [Apple 的打开说明](https://support.apple.com/102445)。
 
-Windows 上优先使用桌面 ZIP。若要排查 JAR 启动问题，请在 PowerShell 中运行 `java -version`，再使用 `java -jar` 启动，以便看到完整错误。不要使用 `target/` 下未包含依赖的普通 Maven JAR。
+Windows 上优先使用桌面 ZIP。若要排查 JAR 启动问题，请在 PowerShell 中运行 `java -version`，进入 JAR 所在目录后用 `java -jar flink-debug-tool-<版本>.jar` 启动，以便看到完整错误。用相对文件名可避开 Java 启动器解析中文绝对路径时的系统代码页问题。源码构建请选择包含依赖的 `*-desktop.jar`。
 
 ## 构建与运行
 
