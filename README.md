@@ -57,8 +57,8 @@ mvn -B -ntp -Dmaven.repo.local=.maven-repo package
 1. 手动下载快照及其引用的全部状态文件。增量 RocksDB checkpoint 往往需要 job 目录下的 `shared` 文件，单独下载 `chk-N/_metadata` 不够。
 2. 打开快照目录或 `_metadata` 文件。先查看文件完整性，再选择左侧算子、子任务。树中优先显示元数据中的算子名称，其次为 UID；缺失时显示“未命名算子”和短 hash。悬停可查看完整名称、UID 和 operator hash。
 3. 如果原文件地址仍是 HDFS/S3 URI，设置“原 URI 前缀 → 本地目录”映射，再重新导入。工具不访问远端，不按文件名猜测映射。
-4. 点击算子会展开子任务，并展示该算子的文件引用。**选择具体子任务，再点击“加载数据”**，同时加载“状态 Schema”和“状态数据”。可按状态名、Key、Value、Map key 和 timer 时间范围筛选；条件在读取状态文件时执行，不受当前页内容限制。使用上一页、下一页浏览其余记录。切换选择或修改筛选条件会使旧页失效，重复选择同一节点会保留已读结果。界面区分未读取、读取中、取消、失败、零结果和部分支持；警告可在“诊断”页查看。
-5. “状态 Schema”显示状态类型和序列化器；“状态数据”展示 Key、Map key、Value、Namespace、TTL 最近访问时间、timer 时间和类型，同时保留原始 HEX 与逐条解码结果。双击单元格可查看和复制完整已返回内容；CSV 导出只针对当前页。“业务状态查询”使用 State Processor API / DataStream BATCH，填写状态名和原始类型后，在本机读取整个算子。
+4. 点击算子会展开子任务，并展示该算子的文件引用。**选择具体子任务，再点击“加载数据”**，同时加载“状态 Schema”和“状态数据”。可按状态名、Key、Value、Map key 和 timer 时间范围筛选；条件在读取状态文件时执行，不受当前页内容限制。修改后点击数据页的“应用筛选”。使用上一页、下一页浏览其余记录。切换选择或修改筛选条件会使旧页失效；取消或失败的翻页会保留同一条件下已成功加载的页。数据页可直接打开诊断，导入诊断和当前查询诊断会分别标注。
+5. “状态 Schema”显示状态类型和序列化器；“状态数据”展示 Key、Map key、Value、Namespace、TTL 最近访问时间、timer 时间和类型，同时保留原始 HEX 与逐条解码结果。桌面 timer 条件可输入 Unix 毫秒整数或带偏移量的 ISO 8601 时间（如 `2026-01-01T00:00:00Z`），精度为毫秒；时间列按数值排序，悬停显示 UTC。双击单元格可查看和复制完整已返回的纯文本；表格排序和 CSV 导出只针对当前页。“业务状态查询”使用 State Processor API / DataStream BATCH，填写状态名和原始类型后，在本机读取整个算子。
 6. Flink `PojoSerializer` 的对象解码可添加原作业 JAR 及相关依赖，恢复快照所记录的类型。缺失类、Kryo 或自定义序列化器可能只能返回原始 HEX 或部分解码结果，请以每行的“解码结果”为准。标准业务查询仅支持界面列出的基本类型和默认 namespace。
 
 例如，远端快照引用 `s3://bucket/checkpoints/job-id/shared/a.sst`，本地保留如下结构：
@@ -96,7 +96,9 @@ java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar \
 
 分页条件在后台读取时执行：`--state` 精确匹配状态名，`--key-contains`、`--value-contains`、`--map-key-contains` 为区分大小写的子串匹配，多个条件使用 AND；`--timer-from`、`--timer-to` 为包含端点的时间戳范围，单位毫秒。Map key 条件只匹配 MapState，timer 范围只匹配 timer。
 
-每页最多 1000 条，同时使用 32 MiB 的解码文本保留预算；大记录可能让每页条数减少，仍可继续翻页。使用响应的 `page.nextOffset` 继续请求，其他条件保持一致，不要假定下一页 offset 一定增加所配置的每页条数。`page.offset`/`nextOffset` 是符合条件记录的位置；`page.scanned` 是本次请求扫描的记录数，不是整个状态的总条数。只有 `page.hasMore=false` 且 `page.complete=true` 才表示该子任务在所选范围内已遍历完。存在不支持的布局、解码失败或无法判定的筛选字段时，会保留 RAW 或警告，并标记 `complete=false`，不会把不完整结果标为全量。分页会重新扫描本地只读副本，大状态后面的页可能需要更长时间；可选择具体状态缩小范围。
+每页最多 1000 条，同时使用 32 MiB 的解码文本保留预算；大记录可能让每页条数减少，仍可继续翻页。使用响应的 `page.nextOffset` 继续请求，其他条件保持一致，不要假定下一页 offset 一定增加所配置的每页条数。`page.offset`/`nextOffset` 是符合条件记录的位置；`page.scanned` 是本次请求检查的记录数，不是整个状态的总条数。只有 `page.hasMore=false` 且 `page.complete=true` 才表示该子任务在所选范围内已遍历完。存在不支持的布局、解码失败或无法判定的筛选字段时，会保留 RAW 或警告，并标记 `complete=false`。
+
+桌面在同一次导入中，对单个 RocksDB 增量句柄复用一份私有副本。使用相同条件连续点“下一页”时，从上一页找到的第一条未返回记录继续，避免重复复制文件和扫描前面的记录。上一页、跳到其他偏移、变更筛选、独立 CLI 调用及 canonical savepoint 仍可按偏移读取。每次复用前检查引用文件；若文件被修改或缺失，会丢弃旧副本及续读位置。下载内容有变时，建议重新导入并从第一页读取。
 
 没有现成快照时，可用 Flink 生成一个真实的示例 savepoint，再在界面导入：
 
@@ -112,11 +114,11 @@ java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar --create-example /t
 |---|---|
 | `_metadata` | checkpoint ID、格式版本、operator hash、并行度、max parallelism、subtask handle；元数据实际保存名称/UID 且运行时 API 可读取时显示名称/UID |
 | 文件检查 | 本地路径映射、文件缺失、声明/实际大小、shared/private/meta 引用 |
-| 状态数据 | Canonical keyed snapshot（含 Snappy）、RocksDB incremental handle，按状态及解码字段筛选、每页最多 1000 条且可连续翻页；支持可识别布局的 Value/Reducing/Aggregating、MapState、标准 scalar、Flink PojoSerializer（需要对应作业 JAR）、内置 TTL 包装和常用 timer；保留原始 HEX 和逐条解码结果 |
+| 状态数据 | Canonical keyed snapshot（含 Snappy）、RocksDB incremental handle，按状态及解码字段筛选、每页最多 1000 条且可连续翻页；支持可识别布局的 Value/Reducing/Aggregating、MapState、标准 scalar、Flink PojoSerializer（需要对应作业 JAR）、内置 TTL 包装和常用 timer；窗口状态支持 `TimeWindow` / `GlobalWindow` 命名空间，识别 canonical MapState 的 null；保留原始 HEX 和逐条解码结果 |
 | Timer | Flink `TimerSerializer` 的 event-time / processing-time 队列，展示 Key、Namespace、存储的毫秒时间戳；支持基础 Key 及 Void、基础类型、TimeWindow、GlobalWindow namespace；类型仅按 Flink 保留队列前缀识别，未知队列类型留空 |
 | 业务查询 | State Processor API + 本地 DataStream BATCH，Value/List/Map 的标准类型、默认 namespace |
-| 原文件保护 | 文件只读；RocksDB 原始预览和业务查询在临时副本上读取/恢复，结束后清理 |
-| 导出 | 元数据报告 JSON、当前状态页 CSV；包含 Map key、存储的 TTL 时间戳、timer 时间/类型、解码结果和原始 HEX，导出不代表全 checkpoint 的全部数据 |
+| 原文件保护 | 文件只读；RocksDB 原始预览使用私有临时副本，快照切换或关闭时清理。业务查询单独复制，查询结束时清理 |
+| 导出 | 元数据报告 JSON 包含当前页使用的筛选条件；CSV 导出当前状态页。数据包含 Map key、存储的 TTL 时间戳、timer 时间/类型、解码结果和原始 HEX |
 
 业务查询对 native savepoint/aligned checkpoint 为实验性支持；不支持 unaligned checkpoint 的业务查询。窗口 namespace、TTL/custom serializer 的高层业务查询、changelog、状态修改、跨快照 diff、全量 SQL 尚未实现。原始预览对 Kryo、自定义序列化器、ListState 和未知 timer 序列化器等布局仍可能返回 `RAW`；失败或部分解码不会把未知字节解释为业务对象，原始 HEX 会继续保留。Operator/broadcast/raw state 和 channel buffers 尚未完整解码，分页不意味着支持任意状态格式。
 
@@ -138,7 +140,9 @@ Java 17+ 的必要模块访问参数已写入 desktop JAR 的 manifest（`java.b
 mvn -B -ntp test
 ```
 
-自动化测试覆盖真实 metadata roundtrip、canonical 与 Snappy 内容、RocksDB 增量文件与 key-group 范围、本地及 S3 URI 映射后的 State Processor API 查询、缺失/截断/大小异常、取消、路径映射，以及源文件的 SHA-256/大小/mtime 保持一致。另已用打包后的 JAR 验证示例快照生成、CLI 导入和桌面导入/原始样本/业务查询。集成测试在本机启动临时 Flink MiniCluster，需要本地回环端口。
+自动化测试覆盖真实 metadata roundtrip、canonical 与 Snappy 内容、堆后端 MapState null、窗口命名空间和复合键长度、RocksDB 增量文件和 key-group 范围、连续翻页及切换条件、本地及 S3 URI 映射后的 State Processor API 查询、缺失/截断/大小异常、取消、路径映射，以及源文件的 SHA-256/大小/mtime 保持一致。另已用打包后的 JAR 验证示例快照生成、CLI 导入和桌面导入/原始样本/业务查询。集成测试在本机启动临时 Flink MiniCluster，需要本地回环端口。
+
+顺序翻页基准：在同一台 Apple Silicon 机器上，使用约 81 MiB 的人工 RocksDB 增量快照（8 万条 1 KiB String 值，约四分之一匹配），连续读取 40 页、每页 400 条，共返回 1.6 万条。与 v0.1.0 比较，检查记录数由 1,311,183 降到 64,078，三次测试的中位时间由 3.95 秒降到 0.24 秒；返回顺序和内容的 SHA-256 相同。每次计时均从新会话开始，含首次文件复制。实际耗时取决于本机磁盘及快照大小。
 
 ## 本地数据
 
