@@ -100,6 +100,15 @@ function Invoke-Checked {
     }
 }
 
+function Clear-ReadOnlyAttribute {
+    param([string] $Path)
+    $attributes = [IO.File]::GetAttributes($Path)
+    if ($attributes -band [IO.FileAttributes]::ReadOnly) {
+        $writable = $attributes -band (-bnot [int][IO.FileAttributes]::ReadOnly)
+        [IO.File]::SetAttributes($Path, [IO.FileAttributes] $writable)
+    }
+}
+
 function Set-Utf8LauncherManifest {
     param([string] $Executable)
     $kit = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' `
@@ -150,7 +159,32 @@ function Set-Utf8LauncherManifest {
     }
     $codePage.InnerText = 'UTF-8'
     $document.Save($manifestPath)
-    $null = Invoke-Checked $mt @('-nologo', '-manifest', $manifestPath, "-outputresource:$Executable;#1")
+
+    # Rewrite a writable copy: jpackage's launcher may be read-only or briefly locked
+    # by Windows scanning the new executable. Each retry starts from an untouched copy.
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        $edited = Join-Path $workspace "launcher-edit-$attempt.exe"
+        try {
+            [IO.File]::Copy($Executable, $edited)
+            Clear-ReadOnlyAttribute $edited
+            $null = Invoke-Checked $mt @('-nologo', '-manifest', $manifestPath, "-outputresource:$edited;#1")
+            Clear-ReadOnlyAttribute $Executable
+            [IO.File]::Move($edited, $Executable, $true)
+            break
+        } catch {
+            if ($attempt -eq 5 -or $_.Exception.Message -notmatch 'c101008d|access.*denied|sharing violation|being used by another process') { throw }
+            Write-Host "Windows is holding the launcher; retrying manifest update ($attempt/5)."
+            Start-Sleep -Milliseconds (400 * $attempt)
+        }
+    }
+
+    $verifiedManifestPath = Join-Path $workspace 'launcher-embedded.manifest'
+    $null = Invoke-Checked $mt @('-nologo', "-inputresource:$Executable;#1", "-out:$verifiedManifestPath")
+    $document.Load($verifiedManifestPath)
+    $embeddedCodePage = $document.DocumentElement.SelectSingleNode('app:application/app:windowsSettings/settings:activeCodePage', $namespaces)
+    if (-not $embeddedCodePage -or $embeddedCodePage.InnerText -cne 'UTF-8') {
+        throw 'The patched Windows launcher did not preserve the requested UTF-8 code page.'
+    }
 }
 
 function Test-SwingLauncher {
