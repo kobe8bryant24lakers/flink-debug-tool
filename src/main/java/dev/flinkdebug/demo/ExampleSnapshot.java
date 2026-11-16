@@ -42,8 +42,11 @@ public final class ExampleSnapshot {
         var source = env.fromCollection(List.of(Tuple2.of("alice", 7L), Tuple2.of("bob", 3L), Tuple2.of("alice", 5L)), Types.TUPLE(Types.STRING, Types.LONG));
         var bootstrap = OperatorTransformation.bootstrapWith(source).setMaxParallelism(128)
                 .keyBy(new OrderKey(), Types.STRING).transform(new Bootstrap());
+        // Flink's String API expects its own path representation, not an encoded URI string.
+        // Passing URI.toString() would encode spaces a second time in Path(String).
+        String outputPath = new org.apache.flink.core.fs.Path(directory.toAbsolutePath().toUri()).toString();
         SavepointWriter.newSavepoint(env, new EmbeddedRocksDBStateBackend(), 128)
-                .withOperator(UID, bootstrap).write(directory.toAbsolutePath().toUri().toString());
+                .withOperator(UID, bootstrap).write(outputPath);
         env.execute("Flink State Lens · generate example savepoint");
     }
 

@@ -4,6 +4,21 @@
 
 离线 Flink 状态分析桌面工具。导入手动下载的 checkpoint/savepoint，像查看 dump 一样定位到算子、子任务、状态文件和状态数据，支持按条件读取和分页浏览。当前适配 **Flink 1.20 + RocksDB**，依赖锁定 1.20.5；使用 Java 17+、Maven 和 Swing。
 
+## 下载和启动
+
+从 [GitHub Releases](https://github.com/kobe8bryant24lakers/flink-debug-tool/releases/latest) 选择对应文件。桌面 ZIP 自带 Java 运行时，解压后可以离线打开，无需另装 Java、Maven 或 Flink。
+
+| 平台 | 下载文件 | 启动方式 |
+| --- | --- | --- |
+| Windows 10（1903 或更新版本）/11 x64 | `flink-debug-tool-<版本>-windows-x64.zip` | 解压整个 ZIP，双击 `Flink State Lens.exe`。请保留同目录的 `app` 与 `runtime`。 |
+| macOS Apple Silicon | `flink-debug-tool-<版本>-macos-arm64.zip` | 解压，打开 `Flink State Lens.app`。 |
+| macOS Intel | `flink-debug-tool-<版本>-macos-x64.zip` | 解压，打开 `Flink State Lens.app`。 |
+| 已有 Java 的用户 | `flink-debug-tool-<版本>.jar` | 在终端执行 `java -jar flink-debug-tool-<版本>.jar`；需要 Java 17 或更高版本。在 Windows 上使用 x64 Java。 |
+
+发布包未使用商业代码签名证书。首次打开时，Windows 或 macOS 可能提示发布方无法验证；可用 Release 中的 `SHA256SUMS.txt` 校验下载文件。若 macOS 阻止打开已校验的应用，请参照 [Apple 的打开说明](https://support.apple.com/102445)。
+
+Windows 上优先使用桌面 ZIP。若要排查 JAR 启动问题，请在 PowerShell 中运行 `java -version`，进入 JAR 所在目录后用 `java -jar flink-debug-tool-<版本>.jar` 启动，以便看到完整错误。用相对文件名可避开 Java 启动器解析中文绝对路径时的系统代码页问题。源码构建请选择包含依赖的 `*-desktop.jar`。
+
 ## 构建与运行
 
 ```sh
@@ -34,6 +49,8 @@ java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar \
 ```sh
 mvn -B -ntp -Dmaven.repo.local=.maven-repo package
 ```
+
+从源码构建 Windows 发布包时，需要用 Release 模式的 RocksDB JNI 替换 Maven 依赖内的调试版 DLL。参考 [原生打包工作流](.github/workflows/release.yml) 的 Windows 步骤：先执行 `packaging/windows/build-rocksdb.ps1`，再执行 `mvn -B -ntp -Pwindows-native verify`，最后运行 `scripts/package-windows.ps1`。原生包分别在 Windows x64、macOS Apple Silicon 和 macOS Intel 上构建及验证。推送 `vX.Y.Z` 标签会在全部验证通过后创建带 JAR、三个 ZIP 和 SHA-256 校验值的 GitHub Release 草稿。
 
 ## 使用流程
 
@@ -101,7 +118,7 @@ java -jar target/flink-debug-tool-0.1.0-SNAPSHOT-desktop.jar --create-example /t
 | 原文件保护 | 文件只读；RocksDB 原始预览和业务查询在临时副本上读取/恢复，结束后清理 |
 | 导出 | 元数据报告 JSON、当前状态页 CSV；包含 Map key、存储的 TTL 时间戳、timer 时间/类型、解码结果和原始 HEX，导出不代表全 checkpoint 的全部数据 |
 
-业务查询对 native savepoint/aligned checkpoint 为实验性支持；不支持 unaligned checkpoint 的业务查询。窗口 namespace、TTL/custom serializer 的高层业务查询、changelog、状态修改、跨快照 diff、全量 SQL 和安装包尚未实现。原始预览对 Kryo、自定义序列化器、ListState 和未知 timer 序列化器等布局仍可能返回 `RAW`；失败或部分解码不会把未知字节解释为业务对象，原始 HEX 会继续保留。Operator/broadcast/raw state 和 channel buffers 尚未完整解码，分页不意味着支持任意状态格式。
+业务查询对 native savepoint/aligned checkpoint 为实验性支持；不支持 unaligned checkpoint 的业务查询。窗口 namespace、TTL/custom serializer 的高层业务查询、changelog、状态修改、跨快照 diff、全量 SQL 尚未实现。原始预览对 Kryo、自定义序列化器、ListState 和未知 timer 序列化器等布局仍可能返回 `RAW`；失败或部分解码不会把未知字节解释为业务对象，原始 HEX 会继续保留。Operator/broadcast/raw state 和 channel buffers 尚未完整解码，分页不意味着支持任意状态格式。
 
 样本中的 `ttlTimestamp` 是快照实际存储的 TTL 最近访问时间，单位为毫秒；无 TTL 包装时为空。工具展示该时间戳和可解码值，不自动过滤记录，也不推断是否过期：原作业的 TTL 时长、更新策略和状态可见性配置不在快照中。MapState 的 TTL 时间戳对应具体 Map entry。
 
